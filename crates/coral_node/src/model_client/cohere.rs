@@ -468,6 +468,7 @@ mod tests {
                     "required": ["location"],
                 }),
             }],
+            runtime_tools: Vec::new(),
             model: None,
             options: CompleteOptions {
                 max_tokens: 256,
@@ -527,6 +528,7 @@ mod tests {
         let req = CompleteRequest {
             messages: vec![Message::user("hi")],
             tools: vec![],
+            runtime_tools: Vec::new(),
             model: None,
             options: CompleteOptions {
                 max_tokens: 32,
@@ -551,6 +553,7 @@ mod tests {
         let req = CompleteRequest {
             messages: vec![Message::user("hi")],
             tools: vec![],
+            runtime_tools: Vec::new(),
             model: None,
             options: CompleteOptions {
                 max_tokens: 8,
@@ -590,6 +593,7 @@ mod tests {
                 },
             ],
             tools: vec![],
+            runtime_tools: Vec::new(),
             model: None,
             options: CompleteOptions {
                 max_tokens: 32,
@@ -632,6 +636,7 @@ mod tests {
                 ],
             }],
             tools: vec![],
+            runtime_tools: Vec::new(),
             model: None,
             options: CompleteOptions {
                 max_tokens: 32,
@@ -660,6 +665,7 @@ mod tests {
                 }],
             }],
             tools: vec![],
+            runtime_tools: Vec::new(),
             model: None,
             options: CompleteOptions {
                 max_tokens: 8,
@@ -692,6 +698,7 @@ mod tests {
                 },
             ],
             tools: vec![],
+            runtime_tools: Vec::new(),
             model: None,
             options: CompleteOptions {
                 max_tokens: 32,
@@ -917,6 +924,7 @@ mod tests {
         let req = CompleteRequest {
             messages: vec![Message::user("hi")],
             tools: vec![],
+            runtime_tools: Vec::new(),
             model: None,
             options: CompleteOptions {
                 max_tokens: 32,

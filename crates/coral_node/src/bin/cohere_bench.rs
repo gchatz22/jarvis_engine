@@ -295,6 +295,7 @@ async fn main() -> std::process::ExitCode {
             messages: messages.clone(),
             tools: tools.clone(),
             options: options.clone(),
+            runtime_tools: Vec::new(),
             model: None,
         };
         match client.complete(req).await {

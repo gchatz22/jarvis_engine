@@ -125,6 +125,13 @@ pub struct CompleteRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub options: CompleteOptions,
+    /// Granted runtime tools, carried with their own typed schemas so a
+    /// vendor adapter can offer them as first-class functions instead of a
+    /// generic `call_tool` wrapper. Empty for every path that doesn't flatten
+    /// (Anthropic, and Cohere until a grant is threaded through) — an empty
+    /// list means "offer `tools` as-is," preserving the prior behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_tools: Vec<ToolSpec>,
     /// Per-request model override. `None` (the default and the serialized
     /// shape when absent) falls back to the adapter's configured model.
     /// Carries a per-agent `Mandate.model` through to the vendor adapter;
@@ -463,6 +470,7 @@ mod tests {
         let base = CompleteRequest {
             messages: vec![],
             tools: vec![],
+            runtime_tools: Vec::new(),
             model: None,
             options: CompleteOptions::default(),
         };
@@ -483,6 +491,7 @@ mod tests {
         let req = CompleteRequest {
             messages: vec![],
             tools: vec![],
+            runtime_tools: Vec::new(),
             model: None,
             options: CompleteOptions::default(),
         };

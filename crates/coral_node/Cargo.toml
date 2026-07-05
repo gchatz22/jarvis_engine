@@ -34,6 +34,11 @@ path = "src/bin/node_run_llm.rs"
 # `required-features` would pin a single conjunction; cargo does not support OR.
 # Vendor + `mcp` are gated at runtime inside the binary instead.
 
+[[bin]]
+name = "cohere-bench"
+path = "src/bin/cohere_bench.rs"
+required-features = ["llm-cohere"]
+
 [dependencies]
 anyhow = "1"
 async-trait = "0.1"

@@ -186,6 +186,15 @@ pub fn tool_registry_provider() -> Arc<dyn ToolRegistryProvider> {
         .expect("tool_registry_provider() accessed before install_tool_registry[_provider]()")
 }
 
+/// Like [`tool_registry_provider`] but returns `None` instead of panicking
+/// when no provider is installed. Used where a missing registry should
+/// degrade gracefully rather than abort — resolving an agent's runtime-tool
+/// schemas for the flatten path is optional (an empty set just falls back to
+/// the generic `call_tool`).
+pub fn try_tool_registry_provider() -> Option<Arc<dyn ToolRegistryProvider>> {
+    TOOL_REGISTRY_PROVIDER.get().cloned()
+}
+
 /// Structural-DB writer surface the `register_child_in_structural_db`
 /// activity reaches for. Defined as a trait here (not a concrete type) to
 /// avoid a `coral_temporal` -> `coral_graph` dependency cycle, mirroring

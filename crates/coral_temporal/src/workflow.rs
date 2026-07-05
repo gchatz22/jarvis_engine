@@ -819,6 +819,7 @@ async fn build_seed(
             BuildSeedInput {
                 mandate: input.mandate.clone(),
                 fs_handle: input.fs_handle.clone(),
+                graph_id: input.graph_id,
                 triggers: drained.triggers,
                 human_ops: drained.human_ops,
                 mandate_patches: drained.mandate_patches,

@@ -4,6 +4,7 @@
 //! collapse to one record on disk.
 
 use crate::evidence::EvidenceRecord;
+use crate::model_client::ToolSpec;
 use anyhow::{anyhow, bail};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -26,6 +27,22 @@ pub trait Tool: Send + Sync {
     /// bubble up as `anyhow::Error`; the registry does not wrap them in an
     /// `EvidenceRecord` (failures are not evidence).
     async fn call(&self, args: Value) -> anyhow::Result<Value>;
+
+    /// The tool's argument schema as a JSON Schema object, used to offer the
+    /// tool to a model as a first-class typed function on the flatten path.
+    /// The default is a permissive open object; a tool offered under a
+    /// grammar-constrained decoder (Cohere `strict_tools`) must override this
+    /// with a closed, strict-compatible schema (typed properties, at least one
+    /// required field, no free-form objects or `oneOf`).
+    fn input_schema(&self) -> Value {
+        json!({ "type": "object", "properties": {}, "additionalProperties": true })
+    }
+
+    /// One-line description shown to the model when the tool is offered
+    /// first-class. Defaults to the tool's name.
+    fn description(&self) -> String {
+        self.name().to_string()
+    }
 }
 
 /// Registry of `Tool` implementations keyed by `Tool::name`.
@@ -98,6 +115,26 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
+    /// The typed [`ToolSpec`]s of every registered tool an agent assigned
+    /// `allowed_defs` may call. Used to offer a Cohere agent's granted runtime
+    /// tools as first-class typed functions on the flatten path. Sorted by
+    /// name so the result is deterministic across a Temporal replay (the
+    /// backing map iterates in arbitrary order).
+    pub fn specs_for(&self, allowed_defs: &[String]) -> Vec<ToolSpec> {
+        let mut specs: Vec<ToolSpec> = self
+            .tools
+            .values()
+            .filter(|t| self.is_call_allowed(t.name(), allowed_defs))
+            .map(|t| ToolSpec {
+                name: t.name().to_string(),
+                description: t.description(),
+                input_schema: t.input_schema(),
+            })
+            .collect();
+        specs.sort_by(|a, b| a.name.cmp(&b.name));
+        specs
+    }
+
     /// Look up the named tool, invoke it with `args`, and wrap the
     /// `(name, args, result)` triple into an `EvidenceRecord`.
     ///
@@ -136,6 +173,20 @@ impl Tool for EchoTool {
     async fn call(&self, args: Value) -> anyhow::Result<Value> {
         Ok(json!({ "echoed": args }))
     }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "msg": { "type": "string", "description": "Text to echo back." }
+            },
+            "required": ["msg"]
+        })
+    }
+
+    fn description(&self) -> String {
+        "Echo the given `msg` back — a stand-in evidence-minting tool.".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +210,34 @@ mod tests {
         async fn call(&self, _args: Value) -> anyhow::Result<Value> {
             Ok(self.result.clone())
         }
+    }
+
+    #[test]
+    fn specs_for_returns_typed_specs_of_granted_tools_sorted() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Arc::new(EchoTool)).unwrap();
+        reg.register(Arc::new(ConstTool {
+            name: "zeta".into(),
+            result: json!(0),
+        }))
+        .unwrap();
+        reg.record_owner("echo", "echo-def");
+        reg.record_owner("zeta", "zeta-def");
+
+        // Only the granted def's tool is returned, with its typed schema.
+        let specs = reg.specs_for(&["echo-def".to_string()]);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].name, "echo");
+        assert_eq!(specs[0].input_schema["required"], json!(["msg"]));
+
+        // Granting both defs returns both, sorted by name (deterministic
+        // across a Temporal replay).
+        let both = reg.specs_for(&["echo-def".to_string(), "zeta-def".to_string()]);
+        let names: Vec<&str> = both.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["echo", "zeta"]);
+
+        // An unknown/ungranted def resolves to nothing.
+        assert!(reg.specs_for(&["nope".to_string()]).is_empty());
     }
 
     #[tokio::test]

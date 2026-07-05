@@ -55,6 +55,7 @@
 
 use crate::agent_ref::AgentRef;
 use crate::mandate::{Mandate, OutputId};
+use crate::model_client::ToolSpec;
 use crate::trigger::Trigger;
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -378,6 +379,12 @@ pub struct Seed {
     pub mandate: Mandate,
     pub triggers: Vec<Trigger>,
     pub index: FsIndex,
+    /// The agent's granted runtime tools with their typed schemas, resolved
+    /// from the registry at seed-build time. Carried so the decide path can
+    /// offer them to a model as first-class functions (the Cohere flatten
+    /// path); empty by default and ignored by adapters that don't flatten.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_tools: Vec<ToolSpec>,
 }
 
 impl Seed {
@@ -386,6 +393,7 @@ impl Seed {
             mandate,
             triggers,
             index,
+            runtime_tools: Vec::new(),
         }
     }
 }

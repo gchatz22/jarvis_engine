@@ -165,7 +165,7 @@ impl Decide for LlmDecide {
                     messages: messages.clone(),
                     tools: tools.clone(),
                     options: self.options.clone(),
-                    runtime_tools: Vec::new(),
+                    runtime_tools: session.seed.runtime_tools.clone(),
                     model: model.clone(),
                 })
                 .await

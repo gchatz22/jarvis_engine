@@ -41,6 +41,10 @@ use crate::workflow::{AgentConfig, FsHandle};
 pub struct BuildSeedInput {
     pub mandate: Mandate,
     pub fs_handle: FsHandle,
+    /// Graph this agent belongs to. Lets the activity resolve the agent's
+    /// granted runtime tools' typed schemas from the per-graph registry and
+    /// attach them to the seed (the Cohere flatten path).
+    pub graph_id: GraphId,
     pub triggers: Vec<Trigger>,
     /// Human overrides drained alongside `triggers`. Folded into the
     /// `Trigger::HumanOverride` taxonomy and appended after the regular
@@ -617,7 +621,20 @@ impl AgentActivities {
             );
         }
 
-        let seed = agent_core::build_seed(&fs, triggers, &input.mandate).await?;
+        let mut seed = agent_core::build_seed(&fs, triggers, &input.mandate).await?;
+        // Resolve the agent's granted runtime tools' typed schemas so the
+        // decide path can offer them first-class (the Cohere flatten path).
+        // Best-effort: a missing provider or registry-build failure leaves the
+        // set empty, which simply falls back to the generic `call_tool`.
+        if let Some(provider) = crate::worker::try_tool_registry_provider() {
+            match provider.registry_for_graph(input.graph_id).await {
+                Ok(registry) => seed.runtime_tools = registry.specs_for(&input.mandate.tools),
+                Err(e) => tracing::warn!(
+                    error = format!("{e:#}"),
+                    "build_seed: runtime-tool schema resolution failed; flatten disabled this cycle"
+                ),
+            }
+        }
         Ok(BuildSeedOutput { seed })
     }
 
@@ -1328,6 +1345,7 @@ mod tests {
         let i = BuildSeedInput {
             mandate: Mandate::new("", Duration::ZERO, None),
             fs_handle: FsHandle::default(),
+            graph_id: GraphId::new(uuid::Uuid::nil()),
             triggers: Vec::new(),
             human_ops: Vec::new(),
             mandate_patches: Vec::new(),
@@ -1344,6 +1362,7 @@ mod tests {
             fs_handle: FsHandle {
                 prefix: "g1/a1".into(),
             },
+            graph_id: GraphId::new(uuid::Uuid::from_u128(0x9c)),
             triggers: vec![Trigger::ScheduledWake],
             human_ops: vec![HumanOp::new(json!({"action": "pause"}))],
             mandate_patches: vec![MandatePatch::new(json!({"model": "x"}))],

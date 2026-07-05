@@ -39,6 +39,7 @@ pub fn render(session: &Session) -> Vec<Message> {
         mandate,
         triggers,
         index,
+        runtime_tools: _,
     } = &session.seed;
     // At most 4: system + triggers + index + steps.
     let mut out = Vec::with_capacity(4);

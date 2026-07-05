@@ -283,7 +283,7 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
     let offered: Vec<&ToolSpec> = if flatten {
         req.runtime_tools
             .iter()
-            .chain(req.tools.iter().filter(|t| t.name != "call_tool"))
+            .chain(req.tools.iter().filter(|t| !flatten_drops(&t.name)))
             .collect()
     } else {
         req.tools.iter().collect()
@@ -305,6 +305,19 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
         body.insert("tools".into(), Value::Array(tools));
     }
     Value::Object(body)
+}
+
+/// Decision tools omitted from the offered set in flatten mode. `call_tool`
+/// is replaced by the granted runtime tools offered first-class; the
+/// child-management tools carry complex kernel types (`Mandate`, `AgentRef`,
+/// `ConflictRecordIntent`) whose schemas can't yet be made strict-compatible,
+/// so a flattened agent is leaf-capable only — widening to parents is a
+/// follow-up.
+fn flatten_drops(name: &str) -> bool {
+    matches!(
+        name,
+        "call_tool" | "spawn_child" | "reconcile_children" | "retire_child" | "replace_child"
+    )
 }
 
 /// Collapse first-class runtime-tool calls back into the kernel's `call_tool`
@@ -1030,6 +1043,50 @@ mod tests {
             names.contains(&"call_tool"),
             "call_tool preserved: {names:?}"
         );
+    }
+
+    #[test]
+    fn build_body_flatten_drops_call_tool_and_child_mgmt_tools() {
+        let req = CompleteRequest {
+            messages: vec![Message::user("go")],
+            tools: vec![
+                tool_spec("call_tool"),
+                tool_spec("spawn_child"),
+                tool_spec("reconcile_children"),
+                tool_spec("retire_child"),
+                tool_spec("replace_child"),
+                tool_spec("write_output"),
+                tool_spec("rewrite_fs"),
+            ],
+            runtime_tools: vec![tool_spec("web_search")],
+            model: None,
+            options: CompleteOptions::default(),
+        };
+        let body = build_body(&req, "m");
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"web_search"),
+            "runtime tool kept: {names:?}"
+        );
+        assert!(names.contains(&"write_output"), "leaf tool kept: {names:?}");
+        assert!(names.contains(&"rewrite_fs"), "leaf tool kept: {names:?}");
+        for dropped in [
+            "call_tool",
+            "spawn_child",
+            "reconcile_children",
+            "retire_child",
+            "replace_child",
+        ] {
+            assert!(
+                !names.contains(&dropped),
+                "flatten drops {dropped} (leaf-capable only): {names:?}"
+            );
+        }
     }
 
     #[test]

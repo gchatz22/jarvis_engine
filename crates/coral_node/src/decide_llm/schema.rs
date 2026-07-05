@@ -96,15 +96,31 @@ pub fn decision_tools() -> Vec<ToolSpec> {
         ToolSpec {
             name: "rewrite_fs".into(),
             description: "Express the decision to mutate the per-agent filesystem. \
-                 Each op is `{op: \"write_file\", path, content}` or \
-                 `{op: \"delete_file\", path}`."
+                 Each op writes or deletes one file; on a delete, `content` is \
+                 ignored."
                 .into(),
+            // `FsOp` is an internally-tagged enum (`{op, path, content?}`).
+            // Its schema is a hand-written flat struct rather than a `oneOf`
+            // union so it survives grammar-constrained decoding (`strict_tools`
+            // rejects `oneOf`). `content` is always required for the same
+            // reason — strict cannot express per-variant optionality — and a
+            // `delete_file` simply carries an ignored `content` (serde drops the
+            // extra field). The flat shape still matches `FsOp`'s serde form,
+            // so `RewriteFs` deserializes unchanged.
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "ops": {
                         "type": "array",
-                        "items": { "type": "object" }
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "op": { "type": "string", "enum": ["write_file", "delete_file"] },
+                                "path": { "type": "string" },
+                                "content": { "type": "string" }
+                            },
+                            "required": ["op", "path", "content"]
+                        }
                     }
                 },
                 "required": ["ops"]
@@ -175,8 +191,7 @@ pub fn decision_tools() -> Vec<ToolSpec> {
                 "properties": {
                     "next_after": {
                         "type": "integer",
-                        "minimum": 0,
-                        "description": "Milliseconds to wait."
+                        "description": "Milliseconds to wait (non-negative)."
                     }
                 },
                 "required": ["next_after"]

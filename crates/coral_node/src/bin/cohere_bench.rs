@@ -52,6 +52,7 @@ struct Args {
     only_tools: Vec<String>,
     call_tool_variant: String,
     flat: bool,
+    flatten: bool,
     verbose: bool,
 }
 
@@ -65,6 +66,7 @@ fn parse_args() -> Result<Args, String> {
     let mut only_tools = Vec::new();
     let mut call_tool_variant = "baseline".to_string();
     let mut flat = false;
+    let mut flatten = false;
     let mut verbose = false;
 
     let mut argv = std::env::args().skip(1);
@@ -101,6 +103,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--call-tool-variant" => call_tool_variant = val()?,
             "--flat" => flat = true,
+            "--flatten" => flatten = true,
             "--verbose" | "-v" => verbose = true,
             "--help" | "-h" => return Err("usage: cohere-bench [--model ID] [--trials N] [--temperature F] [--max-tokens N] [--mandate-file PATH] [--tools a,b,c] [--only-tools a,b,c] [--call-tool-variant baseline|typed-args|no-claim-seed|lean] [--verbose]".to_string()),
             other => return Err(format!("unknown flag: {other}")),
@@ -116,8 +119,26 @@ fn parse_args() -> Result<Args, String> {
         only_tools,
         call_tool_variant,
         flat,
+        flatten,
         verbose,
     })
+}
+
+/// A typed, strict-compatible runtime tool spec used to exercise the adapter's
+/// real flatten path (`--flatten`): populated into `CompleteRequest.runtime_tools`
+/// so `build_body` offers it first-class and turns on `strict_tools`.
+fn flatten_runtime_tools() -> Vec<ToolSpec> {
+    vec![ToolSpec {
+        name: "web_search".into(),
+        description: "Search the web and return sources for a query.".into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "query": { "type": "string", "description": "The search query." }
+            },
+            "required": ["query"]
+        }),
+    }]
 }
 
 /// Build a `call_tool` input schema for one experiment variant, so a run can
@@ -263,10 +284,19 @@ async fn main() -> std::process::ExitCode {
         max_tokens: args.max_tokens,
         temperature: args.temperature,
     };
+    // `--flatten` engages the adapter's real flatten path: the runtime tool is
+    // offered first-class and `strict_tools` is turned on, so the whole offered
+    // decision set is validated by Cohere. A 400 names any non-strict-compatible
+    // tool; clean generation collapses back to `call_tool`.
+    let runtime_tools = if args.flatten {
+        flatten_runtime_tools()
+    } else {
+        Vec::new()
+    };
 
     println!(
-        "model={} trials={} max_tokens={} temperature={:?}",
-        args.model, args.trials, args.max_tokens, args.temperature
+        "model={} trials={} max_tokens={} temperature={:?} flatten={}",
+        args.model, args.trials, args.max_tokens, args.temperature, args.flatten
     );
     let granted = if args.tools.is_empty() {
         "(none)".to_string()
@@ -295,7 +325,7 @@ async fn main() -> std::process::ExitCode {
             messages: messages.clone(),
             tools: tools.clone(),
             options: options.clone(),
-            runtime_tools: Vec::new(),
+            runtime_tools: runtime_tools.clone(),
             model: None,
         };
         match client.complete(req).await {

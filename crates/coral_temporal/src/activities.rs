@@ -1783,6 +1783,89 @@ mod tests {
         }
     }
 
+    /// FS↔DB consistency (14c): an interrupted write leaves a recoverable
+    /// orphan (never a dangling pointer), and Temporal's at-least-once retry
+    /// *is* the consistency mechanism. The first attempt fails on the citation
+    /// insert *after* the FS write + `file_index` upsert — a crash between the
+    /// two DB halves — so the output is on the FS and version-pinned but has no
+    /// citation. Re-running the (idempotent) activity completes the citation
+    /// and converges, duplicating neither the `file_index` nor the citation.
+    #[tokio::test]
+    async fn persist_output_impl_converges_after_crash_between_halves() {
+        let storage: Arc<dyn coral_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
+        let prefix = "graphs/g1/agents/a-retry/";
+        let cited = plant_evidence(
+            storage.clone(),
+            prefix,
+            "tool_c",
+            json!({"q": "gamma"}),
+            json!({"r": 3}),
+        )
+        .await;
+
+        // Fail only the first citation insert; the retry succeeds.
+        let db = Arc::new(MemoryStructuralDbStore::with_citation_failures(1));
+        let agent_id = AgentId::new(uuid::Uuid::from_u128(0xa3));
+        let output_sha = BlobSha::of_bytes(b"claim R");
+
+        let err = persist_output_impl(
+            storage.clone(),
+            db.clone(),
+            agent_id,
+            prefix,
+            "claim R",
+            &[cited.clone()],
+        )
+        .await
+        .expect_err("first attempt fails on the citation half");
+        assert!(
+            err.to_string().contains("simulated add_citation failure"),
+            "unexpected error: {err}"
+        );
+
+        // Recoverable state: the FS holds the output and `file_index` pinned
+        // its version, but no citation landed — an orphan, not a dangling
+        // pointer (FS-first / DB-second).
+        {
+            let mandate = Mandate::new("inspect", Duration::from_millis(0), None);
+            let fs = AgentFs::new_with_storage(storage.clone(), prefix, &mandate)
+                .await
+                .unwrap();
+            assert_eq!(fs.read_output().await.expect("read output"), "claim R");
+        }
+        assert_eq!(
+            db.current_sha(agent_id, CANONICAL_OUTPUT).as_ref(),
+            Some(&output_sha),
+            "file_index pinned even though the citation half failed"
+        );
+        assert!(
+            db.citations().is_empty(),
+            "no citation recorded from the failed attempt"
+        );
+
+        // Retry (Temporal reschedules the activity) → converges.
+        persist_output_impl(
+            storage.clone(),
+            db.clone(),
+            agent_id,
+            prefix,
+            "claim R",
+            &[cited.clone()],
+        )
+        .await
+        .expect("retry converges");
+
+        assert_eq!(
+            db.file_index_len(),
+            1,
+            "retry's file_index upsert must not duplicate the row"
+        );
+        let cites = db.citations();
+        assert_eq!(cites.len(), 1, "exactly one citation after retry — no dupe");
+        assert_eq!(cites[0].citing_sha, output_sha);
+        assert_eq!(cites[0].cited_path, cited);
+    }
+
     #[tokio::test]
     async fn persist_output_impl_rejects_unresolved_evidence_id() {
         let storage: Arc<dyn coral_node::storage::AgentStorage> = Arc::new(MemoryStorage::new());
@@ -2206,6 +2289,10 @@ mod tests {
         file_index: std::sync::Mutex<Vec<(AgentId, String, BlobSha)>>,
         citations: std::sync::Mutex<Vec<RecordedCitation>>,
         defined_tools: Vec<String>,
+        /// Number of upcoming `add_citation` calls to fail before recording,
+        /// simulating a crash between the two DB halves so a retry can prove
+        /// convergence. `0` (the default) means never fail.
+        citation_failures: std::sync::atomic::AtomicUsize,
     }
 
     impl MemoryStructuralDbStore {
@@ -2220,7 +2307,18 @@ mod tests {
                 file_index: std::sync::Mutex::new(Vec::new()),
                 citations: std::sync::Mutex::new(Vec::new()),
                 defined_tools,
+                citation_failures: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        /// Fail the next `n` `add_citation` calls before recording, then
+        /// succeed — models an interrupted write (crash between the FS write /
+        /// `file_index` upsert and the citation insert).
+        fn with_citation_failures(n: usize) -> Self {
+            let s = Self::new();
+            s.citation_failures
+                .store(n, std::sync::atomic::Ordering::SeqCst);
+            s
         }
 
         /// Current sha bound to `(agent, path)` — last write wins, mirroring
@@ -2233,6 +2331,10 @@ mod tests {
                 .rev()
                 .find(|(a, p, _)| *a == agent && p == path)
                 .map(|(_, _, sha)| sha.clone())
+        }
+
+        fn file_index_len(&self) -> usize {
+            self.file_index.lock().unwrap().len()
         }
 
         fn citations(&self) -> Vec<RecordedCitation> {
@@ -2277,11 +2379,12 @@ mod tests {
             filepath: &str,
             blob_sha: &BlobSha,
         ) -> anyhow::Result<()> {
-            self.file_index.lock().unwrap().push((
-                agent_id,
-                filepath.to_string(),
-                blob_sha.clone(),
-            ));
+            // Upsert on `(agent, path)`, mirroring the real store's
+            // `INSERT … ON CONFLICT (agent_id, filepath) DO UPDATE` — a retry
+            // re-pins in place rather than duplicating the row.
+            let mut fi = self.file_index.lock().unwrap();
+            fi.retain(|(a, p, _)| !(*a == agent_id && p == filepath));
+            fi.push((agent_id, filepath.to_string(), blob_sha.clone()));
             Ok(())
         }
 
@@ -2295,14 +2398,37 @@ mod tests {
             cited_filepath: &str,
             cited_blob_sha: &BlobSha,
         ) -> anyhow::Result<()> {
-            self.citations.lock().unwrap().push(RecordedCitation {
+            if self
+                .citation_failures
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+            {
+                self.citation_failures
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                anyhow::bail!("simulated add_citation failure (crash between halves)");
+            }
+            let row = RecordedCitation {
                 citing_agent: citing_agent_id,
                 citing_path: citing_filepath.to_string(),
                 citing_sha: citing_blob_sha.clone(),
                 cited_agent: cited_agent_id,
                 cited_path: cited_filepath.to_string(),
                 cited_sha: cited_blob_sha.clone(),
+            };
+            // Dedup on the full 6-column edge, mirroring the real store's
+            // `UNIQUE` idempotent insert — a retry converges to one row.
+            let mut cites = self.citations.lock().unwrap();
+            let present = cites.iter().any(|c| {
+                c.citing_agent == row.citing_agent
+                    && c.citing_path == row.citing_path
+                    && c.citing_sha == row.citing_sha
+                    && c.cited_agent == row.cited_agent
+                    && c.cited_path == row.cited_path
+                    && c.cited_sha == row.cited_sha
             });
+            if !present {
+                cites.push(row);
+            }
             Ok(())
         }
     }

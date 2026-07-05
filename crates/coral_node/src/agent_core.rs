@@ -234,6 +234,20 @@ pub async fn decide<D: Decide + ?Sized>(session: &Session, d: &D) -> Result<Deci
 /// it calls `fs.persist_output`, `tools.call`, `fs.read_file`, etc. The
 /// workflow host wraps the same primitive in a journaled activity; the
 /// shared piece is the returned `StepOutcome` shape.
+/// Whether a filesystem step's error is the model's own mistake — a bad
+/// path, a missing target, a write outside its allowed surface, a citation
+/// that doesn't resolve — rather than a storage/infra fault. Model mistakes
+/// fold into an in-cycle correction the model adapts to; only a storage fault
+/// propagates. Every non-`Storage` `FsError` is deterministic and fails
+/// identically on retry, so folding is what keeps a mistake from wedging the
+/// agent under the host's retry.
+pub fn is_model_fault(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<FsError>(),
+        Some(err) if !matches!(err, FsError::Storage { .. })
+    )
+}
+
 pub async fn execute_step(
     fs: &AgentFs,
     tools: &ToolRegistry,
@@ -261,43 +275,60 @@ pub async fn execute_step(
         }
         Decision::RewriteFs { ops } => {
             debug!(op_count = ops.len(), "step: rewrite_fs");
-            fs.apply_ops(ops.clone()).await?;
-            Ok(StepOutcome::ok("notes updated"))
+            match fs.apply_ops(ops.clone()).await {
+                Ok(()) => Ok(StepOutcome::ok("notes updated")),
+                Err(e) if is_model_fault(&e) => {
+                    Ok(StepOutcome::needs_correction(format!("rewrite_fs: {e:#}")))
+                }
+                Err(e) => Err(e),
+            }
         }
         Decision::Read { path } => {
             debug!(path = path.as_str(), "step: read");
             match fs.read_file(path).await {
                 Ok(body) => Ok(StepOutcome::ok(body)),
-                Err(e) => match e.downcast_ref::<FsError>() {
-                    Some(FsError::FileNotFound(_)) => {
-                        Ok(StepOutcome::needs_correction(format!("read: {e:#}")))
-                    }
-                    _ => Err(e),
-                },
+                Err(e) if is_model_fault(&e) => {
+                    Ok(StepOutcome::needs_correction(format!("read: {e:#}")))
+                }
+                Err(e) => Err(e),
             }
         }
         Decision::List { path } => {
             debug!(path = path.as_str(), "step: list");
-            let names = fs.list_dir(path).await?;
-            let body = if names.is_empty() {
-                format!("(empty: {path})")
-            } else {
-                names.join("\n")
-            };
-            Ok(StepOutcome::ok(body))
+            match fs.list_dir(path).await {
+                Ok(names) => {
+                    let body = if names.is_empty() {
+                        format!("(empty: {path})")
+                    } else {
+                        names.join("\n")
+                    };
+                    Ok(StepOutcome::ok(body))
+                }
+                Err(e) if is_model_fault(&e) => {
+                    Ok(StepOutcome::needs_correction(format!("list: {e:#}")))
+                }
+                Err(e) => Err(e),
+            }
         }
         Decision::Search { query, path } => {
             debug!(query = query.as_str(), "step: search");
-            let hits = fs.search(query, path.as_deref()).await?;
-            let body = if hits.is_empty() {
-                format!("(no matches for {query:?})")
-            } else {
-                hits.into_iter()
-                    .map(|(file, line)| format!("{file}: {line}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            };
-            Ok(StepOutcome::ok(body))
+            match fs.search(query, path.as_deref()).await {
+                Ok(hits) => {
+                    let body = if hits.is_empty() {
+                        format!("(no matches for {query:?})")
+                    } else {
+                        hits.into_iter()
+                            .map(|(file, line)| format!("{file}: {line}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    Ok(StepOutcome::ok(body))
+                }
+                Err(e) if is_model_fault(&e) => {
+                    Ok(StepOutcome::needs_correction(format!("search: {e:#}")))
+                }
+                Err(e) => Err(e),
+            }
         }
         // Terminal — handled by the cycle driver, never executed here.
         Decision::Idle { .. } => {
@@ -887,6 +918,80 @@ mod tests {
         assert!(outcome.failure.is_none());
         assert!(outcome.observation.content.contains("a.md"));
         assert!(outcome.observation.content.contains("b.md"));
+    }
+
+    #[tokio::test]
+    async fn execute_list_root_lists_top_level_entries() {
+        let (fs, _m) = fixture().await;
+        fs.apply_ops(vec![FsOp::WriteFile {
+            path: "notes/a.md".into(),
+            content: "x".into(),
+        }])
+        .await
+        .unwrap();
+        let tools = ToolRegistry::new();
+        for root in [".", ""] {
+            let outcome = execute_step(&fs, &tools, &Decision::List { path: root.into() })
+                .await
+                .unwrap();
+            assert!(
+                outcome.failure.is_none(),
+                "listing the root via {root:?} should succeed"
+            );
+            assert!(
+                outcome.observation.content.contains("mandate.md"),
+                "root listing should surface top-level files, got {:?}",
+                outcome.observation.content
+            );
+            assert!(
+                outcome.observation.content.contains("notes/"),
+                "root listing should surface the notes/ subdir, got {:?}",
+                outcome.observation.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_list_traversal_is_a_recoverable_correction() {
+        let (fs, _m) = fixture().await;
+        let tools = ToolRegistry::new();
+        let outcome = execute_step(
+            &fs,
+            &tools,
+            &Decision::List {
+                path: "../escape".into(),
+            },
+        )
+        .await
+        .expect("a bad nav path must fold into a correction, not propagate as an error");
+        assert!(!outcome.observation.ok);
+        assert!(matches!(
+            outcome.failure,
+            Some(StepFailure::NeedsCorrection(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn execute_rewrite_fs_bad_path_is_a_recoverable_correction() {
+        let (fs, _m) = fixture().await;
+        let tools = ToolRegistry::new();
+        let outcome = execute_step(
+            &fs,
+            &tools,
+            &Decision::RewriteFs {
+                ops: vec![FsOp::WriteFile {
+                    path: "../escape.md".into(),
+                    content: "x".into(),
+                }],
+            },
+        )
+        .await
+        .expect("a write to a bad path must fold into a correction, not propagate as an error");
+        assert!(!outcome.observation.ok);
+        assert!(matches!(
+            outcome.failure,
+            Some(StepFailure::NeedsCorrection(_))
+        ));
     }
 
     #[tokio::test]

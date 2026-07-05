@@ -881,7 +881,7 @@ impl AgentFs {
     /// model may probe a dir before anything is written to it.
     pub async fn list_dir(&self, path: &str) -> anyhow::Result<Vec<String>> {
         let rel = self.clean_relpath(path)?;
-        let dir = if rel.ends_with('/') {
+        let dir = if rel.is_empty() || rel.ends_with('/') {
             rel
         } else {
             format!("{rel}/")
@@ -925,7 +925,7 @@ impl AgentFs {
         let prefix = match path {
             Some(p) => {
                 let rel = self.clean_relpath(p)?;
-                let dir = if rel.ends_with('/') {
+                let dir = if rel.is_empty() || rel.ends_with('/') {
                     rel
                 } else {
                     format!("{rel}/")
@@ -1081,6 +1081,11 @@ impl AgentFs {
     /// applied). Rejects any component that could escape the root (`..`,
     /// an absolute root, a Windows prefix). Read-only ops, so there is no
     /// write surface to confine beyond traversal safety.
+    ///
+    /// An empty component set (`.` or `""`) resolves to the empty relpath —
+    /// the agent's own root. That is within the sandbox, not an escape, so
+    /// listing or searching it is legitimate; a read of it is a clean
+    /// not-found (the root is a prefix, not a file).
     fn clean_relpath(&self, raw: &str) -> anyhow::Result<String> {
         let candidate = Path::new(raw);
         let mut parts: Vec<String> = Vec::new();
@@ -1095,9 +1100,6 @@ impl AgentFs {
                     return Err(FsError::PathTraversal(raw.to_string()).into());
                 }
             }
-        }
-        if parts.is_empty() {
-            return Err(FsError::PathTraversal(raw.to_string()).into());
         }
         Ok(parts.join("/"))
     }
@@ -1816,6 +1818,44 @@ mod tests {
             let entries: Vec<_> = std::fs::read_dir(outputs_dir).unwrap().collect();
             assert!(entries.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn list_dir_lists_root_via_dot_and_empty() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        fs.apply_ops(vec![FsOp::WriteFile {
+            path: "notes/a.md".into(),
+            content: "x".into(),
+        }])
+        .await
+        .unwrap();
+        for root in [".", ""] {
+            let names = fs
+                .list_dir(root)
+                .await
+                .unwrap_or_else(|e| panic!("listing root via {root:?} should succeed: {e:#}"));
+            assert!(
+                names.iter().any(|n| n == "mandate.md"),
+                "root {root:?} listing should include mandate.md, got {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "notes/"),
+                "root {root:?} listing should include notes/, got {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_dir_rejects_real_escape() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        let err = fs.list_dir("../outside").await.unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<FsError>(),
+                Some(FsError::PathTraversal(_))
+            ),
+            "an escaping list path must still be rejected"
+        );
     }
 
     #[tokio::test]

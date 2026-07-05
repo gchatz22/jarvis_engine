@@ -193,6 +193,43 @@ pub struct ApplyFsOpsInput {
     pub ops: Vec<FsOp>,
 }
 
+/// Output of [`AgentActivities::apply_fs_ops`] — the observation the workflow
+/// pushes into the session. A write outside the model's allowed surface comes
+/// back as a failure observation the model adapts to, not an `ActivityError`,
+/// so a bad path never wedges the agent under Temporal's retry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApplyFsOpsOutput {
+    pub observation: Observation,
+}
+
+/// Output of [`AgentActivities::persist_output`]. `output_id` is `Some` only
+/// when the output actually persisted; a model-authored provenance mistake
+/// (empty citations, a citation that doesn't resolve) folds into a failure
+/// `observation` with `output_id: None`, so the workflow neither signals the
+/// parent nor retries — the model corrects on its next step instead.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PersistOutputOutput {
+    pub output_id: Option<OutputId>,
+    pub observation: Observation,
+}
+
+/// Fold a [`persist_output_impl`] result into the activity outcome: a
+/// model-authored provenance mistake becomes a failure observation (nothing
+/// persisted, no parent signal); only a storage fault propagates to retry.
+fn persist_outcome(result: anyhow::Result<OutputId>) -> anyhow::Result<PersistOutputOutput> {
+    match result {
+        Ok(output_id) => Ok(PersistOutputOutput {
+            output_id: Some(output_id),
+            observation: Observation::ok("output persisted"),
+        }),
+        Err(e) if agent_core::is_model_fault(&e) => Ok(PersistOutputOutput {
+            output_id: None,
+            observation: Observation::err(format!("write_output: {e:#}")),
+        }),
+        Err(e) => Err(e),
+    }
+}
+
 /// Input to [`AgentActivities::persist_retirement`]. Carries the reason so
 /// retirement is auditable on disk.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -403,10 +440,14 @@ fn pop_scripted_decision() -> Option<Decision> {
 async fn apply_fs_ops_impl(
     storage: std::sync::Arc<dyn coral_node::storage::AgentStorage>,
     input: ApplyFsOpsInput,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ApplyFsOpsOutput> {
     let fs = AgentFs::new_with_storage(storage, &input.fs_handle.prefix, &input.mandate).await?;
-    fs.apply_ops(input.ops).await?;
-    Ok(())
+    let registry = coral_node::tools::ToolRegistry::new();
+    let outcome =
+        agent_core::execute_step(&fs, &registry, &Decision::RewriteFs { ops: input.ops }).await?;
+    Ok(ApplyFsOpsOutput {
+        observation: outcome.observation,
+    })
 }
 
 // Free functions extracted from the activity bodies so hermetic tests
@@ -771,8 +812,8 @@ impl AgentActivities {
     pub async fn persist_output(
         _ctx: ActivityContext,
         input: PersistOutputInput,
-    ) -> Result<OutputId, ActivityError> {
-        let id = persist_output_impl(
+    ) -> Result<PersistOutputOutput, ActivityError> {
+        let result = persist_output_impl(
             agent_storage(),
             structural_db_store(),
             input.agent_id,
@@ -780,8 +821,8 @@ impl AgentActivities {
             &input.body,
             &input.citations,
         )
-        .await?;
-        Ok(id)
+        .await;
+        Ok(persist_outcome(result)?)
     }
 
     /// Reify an [`AgentFs`] over the worker-shared storage at the
@@ -802,9 +843,8 @@ impl AgentActivities {
     pub async fn apply_fs_ops(
         _ctx: ActivityContext,
         input: ApplyFsOpsInput,
-    ) -> Result<(), ActivityError> {
-        apply_fs_ops_impl(crate::worker::agent_storage(), input).await?;
-        Ok(())
+    ) -> Result<ApplyFsOpsOutput, ActivityError> {
+        Ok(apply_fs_ops_impl(crate::worker::agent_storage(), input).await?)
     }
 
     /// Write `retirement.json` via [`AgentFs::persist_retirement`]
@@ -1560,7 +1600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_fs_ops_rejects_traversal_and_leaves_fs_untouched() {
+    async fn apply_fs_ops_folds_traversal_into_correction_and_leaves_fs_untouched() {
         // First write a known-good note so we can prove the second
         // batch's traversal op didn't clobber it.
         let (storage, seed_input) = fresh_storage_and_input(vec![FsOp::WriteFile {
@@ -1581,13 +1621,19 @@ mod tests {
                 content: "escape".into(),
             }],
         };
-        let err = apply_fs_ops_impl(storage.clone(), traversal_input)
+        // A model-authored bad path folds into a correction observation, not
+        // an activity error — otherwise Temporal would retry it forever.
+        let out = apply_fs_ops_impl(storage.clone(), traversal_input)
             .await
-            .expect_err("traversal op must reject");
-        let downcast = err.downcast_ref::<FsError>().expect("typed FsError");
+            .expect("traversal op must fold, not error");
         assert!(
-            matches!(downcast, FsError::PathTraversal(_)),
-            "expected PathTraversal, got {downcast:?}"
+            !out.observation.ok,
+            "traversal op must surface as a failure observation"
+        );
+        assert!(
+            out.observation.content.contains("path traversal rejected"),
+            "correction should name the traversal, got {:?}",
+            out.observation.content
         );
 
         // Original file unchanged.
@@ -1935,18 +1981,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_fs_ops_rejects_path_outside_notes() {
+    async fn apply_fs_ops_folds_path_outside_notes_into_correction() {
         let (storage, input) = fresh_storage_and_input(vec![FsOp::WriteFile {
             path: "outputs/x.json".into(),
             content: "wrong dir".into(),
         }]);
-        let err = apply_fs_ops_impl(storage.clone(), input)
+        let out = apply_fs_ops_impl(storage.clone(), input)
             .await
-            .expect_err("non-notes path must reject");
-        let downcast = err.downcast_ref::<FsError>().expect("typed FsError");
+            .expect("non-notes path must fold, not error");
         assert!(
-            matches!(downcast, FsError::PathOutsideNotes(_)),
-            "expected PathOutsideNotes, got {downcast:?}"
+            !out.observation.ok,
+            "a write outside notes/ must surface as a failure observation"
+        );
+        assert!(
+            out.observation
+                .content
+                .contains("path outside notes/ rejected"),
+            "correction should name the reason, got {:?}",
+            out.observation.content
+        );
+    }
+
+    #[test]
+    fn persist_outcome_carries_output_id_on_success() {
+        let outcome =
+            persist_outcome(Ok(OutputId::from_hex("ab".repeat(32)))).expect("success folds to Ok");
+        assert!(
+            outcome.output_id.is_some(),
+            "a persisted output must carry its id so the parent gets signaled"
+        );
+        assert!(outcome.observation.ok);
+    }
+
+    #[test]
+    fn persist_outcome_folds_provenance_mistake_without_output_id() {
+        // Empty citations is the most common write mistake; it must fold into
+        // a correction, not wedge — and yield no id, so no ChildOutput fires.
+        let outcome = persist_outcome(Err(FsError::EmptyEvidence.into()))
+            .expect("a provenance mistake folds, not errors");
+        assert!(
+            outcome.output_id.is_none(),
+            "a rejected write must not signal the parent"
+        );
+        assert!(!outcome.observation.ok);
+    }
+
+    #[test]
+    fn persist_outcome_propagates_non_model_faults() {
+        let res = persist_outcome(Err(anyhow::anyhow!("db connection lost")));
+        assert!(
+            res.is_err(),
+            "infra faults must propagate to the host's retry, not fold"
         );
     }
 

@@ -862,13 +862,9 @@ async fn execute_action(
     match action {
         Decision::CallTools { calls } => dispatch_call_tools(ctx, input, calls.clone()).await,
         Decision::WriteOutput { body, citations } => {
-            write_output(ctx, input, body.clone(), citations.clone()).await?;
-            Ok(Observation::ok("output persisted"))
+            write_output(ctx, input, body.clone(), citations.clone()).await
         }
-        Decision::RewriteFs { ops } => {
-            rewrite_fs(ctx, &input.fs_handle, ops.clone()).await?;
-            Ok(Observation::ok("notes updated"))
-        }
+        Decision::RewriteFs { ops } => rewrite_fs(ctx, &input.fs_handle, ops.clone()).await,
         Decision::Read { .. } | Decision::List { .. } | Decision::Search { .. } => {
             read_fs(ctx, &input.fs_handle, action).await
         }
@@ -937,13 +933,18 @@ async fn read_fs(
 }
 
 /// Invoke the `persist_output` activity for a `Decision::WriteOutput`.
+///
+/// Returns the observation the model reasons over next. A model-authored
+/// provenance mistake (empty citations, a citation that doesn't resolve)
+/// comes back as a failure observation with no `output_id` — nothing
+/// persisted, so the parent is not signaled and the model corrects in-cycle.
 async fn write_output(
     ctx: &WorkflowContext<AgentWorkflow>,
     input: &AgentInput,
     body: String,
     citations: Vec<String>,
-) -> WorkflowResult<()> {
-    let output_id = ctx
+) -> WorkflowResult<Observation> {
+    let out = ctx
         .start_activity(
             AgentActivities::persist_output,
             PersistOutputInput {
@@ -956,7 +957,7 @@ async fn write_output(
             activity_opts(),
         )
         .await?;
-    if let Some(parent) = &input.parent_handle {
+    if let (Some(output_id), Some(parent)) = (out.output_id, &input.parent_handle) {
         let trigger = Trigger::ChildOutput {
             child_ref: AgentRef::new(ctx.workflow_id().to_string(), input.agent_id),
             agent_name: input.agent_name.clone(),
@@ -964,7 +965,7 @@ async fn write_output(
         };
         signal_parent_with_trigger(ctx, parent, trigger).await;
     }
-    Ok(())
+    Ok(out.observation)
 }
 
 /// Fire a [`Trigger`] payload at the parent workflow via the SDK's
@@ -1008,18 +1009,19 @@ async fn rewrite_fs(
     ctx: &WorkflowContext<AgentWorkflow>,
     fs_handle: &FsHandle,
     ops: Vec<coral_node::decision::FsOp>,
-) -> WorkflowResult<()> {
-    ctx.start_activity(
-        AgentActivities::apply_fs_ops,
-        ApplyFsOpsInput {
-            fs_handle: fs_handle.clone(),
-            mandate: Mandate::new("", Duration::ZERO, None),
-            ops,
-        },
-        activity_opts(),
-    )
-    .await?;
-    Ok(())
+) -> WorkflowResult<Observation> {
+    let out = ctx
+        .start_activity(
+            AgentActivities::apply_fs_ops,
+            ApplyFsOpsInput {
+                fs_handle: fs_handle.clone(),
+                mandate: Mandate::new("", Duration::ZERO, None),
+                ops,
+            },
+            activity_opts(),
+        )
+        .await?;
+    Ok(out.observation)
 }
 
 /// Invoke the `append_decision_log` activity for the current tick's

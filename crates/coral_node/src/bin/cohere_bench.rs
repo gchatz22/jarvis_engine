@@ -46,6 +46,7 @@ struct Args {
     temperature: Option<f32>,
     max_tokens: u32,
     mandate: String,
+    tools: Vec<String>,
     verbose: bool,
 }
 
@@ -55,6 +56,7 @@ fn parse_args() -> Result<Args, String> {
     let mut temperature = None;
     let mut max_tokens = 1024u32;
     let mut mandate = DEFAULT_MANDATE.to_string();
+    let mut tools = Vec::new();
     let mut verbose = false;
 
     let mut argv = std::env::args().skip(1);
@@ -75,8 +77,15 @@ fn parse_args() -> Result<Args, String> {
                 mandate = std::fs::read_to_string(&path)
                     .map_err(|e| format!("reading {path}: {e}"))?;
             }
+            "--tools" => {
+                tools = val()?
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             "--verbose" | "-v" => verbose = true,
-            "--help" | "-h" => return Err("usage: cohere-bench [--model ID] [--trials N] [--temperature F] [--max-tokens N] [--mandate-file PATH] [--verbose]".to_string()),
+            "--help" | "-h" => return Err("usage: cohere-bench [--model ID] [--trials N] [--temperature F] [--max-tokens N] [--mandate-file PATH] [--tools a,b,c] [--verbose]".to_string()),
             other => return Err(format!("unknown flag: {other}")),
         }
     }
@@ -86,14 +95,21 @@ fn parse_args() -> Result<Args, String> {
         temperature,
         max_tokens,
         mandate,
+        tools,
         verbose,
     })
 }
 
-/// Build the prompt a fresh child sees on its kickoff wake: its mandate, a
-/// kickoff trigger, and an empty file index.
-fn kickoff_session(mandate_text: &str) -> Session {
-    let mandate = Mandate::new(mandate_text, Duration::from_secs(60), None);
+/// Build the prompt a fresh child sees on its kickoff wake: its mandate, its
+/// granted tools, a kickoff trigger, and an empty file index.
+///
+/// The tool grant is load-bearing for fidelity: with no tools the model
+/// cannot call anything, cannot mint evidence, and so cannot write a sourced
+/// Output — leaving `read`/`list` as the only non-failing moves. A realistic
+/// grant is what makes "gather evidence, then write" an available path.
+fn kickoff_session(mandate_text: &str, tools: &[String]) -> Session {
+    let mut mandate = Mandate::new(mandate_text, Duration::from_secs(60), None);
+    mandate.tools = tools.to_vec();
     let kickoff = Trigger::External {
         kind: "kickoff".to_string(),
         payload: json!({}),
@@ -147,7 +163,7 @@ async fn main() -> std::process::ExitCode {
     }
 
     let client = CohereClient::new().with_model(&args.model);
-    let session = kickoff_session(&args.mandate);
+    let session = kickoff_session(&args.mandate, &args.tools);
     let messages = render(&session);
     let tools = decision_tools();
     let options = CompleteOptions {
@@ -159,7 +175,12 @@ async fn main() -> std::process::ExitCode {
         "model={} trials={} max_tokens={} temperature={:?}",
         args.model, args.trials, args.max_tokens, args.temperature
     );
-    println!("tools offered: {}", tools.len());
+    let granted = if args.tools.is_empty() {
+        "(none)".to_string()
+    } else {
+        args.tools.join(", ")
+    };
+    println!("decision tools offered: {} | tools granted: {granted}", tools.len());
 
     let mut valid = 0u32;
     let mut parse_failed = 0u32;

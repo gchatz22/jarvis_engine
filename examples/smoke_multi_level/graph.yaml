@@ -1,0 +1,47 @@
+# Linear 3-level all-`never` fixture: root <- mid <- leaf. The smallest
+# shape that exercises MULTI-LEVEL child->parent output propagation, where
+# the MID node both RECEIVES a ChildOutput (from leaf) and FIRES its own
+# (to root). Every node runs `idle_period: never`, so the only wakes are
+# the first-cycle wake and the ChildOutput signals — nothing polls. A
+# leaf-level output therefore assembles the root output hop-by-hop, or not
+# at all.
+#
+# MockDecide scripts every decision; the mandate text is the routing
+# discriminator. No agent dispatches a tool — the top-level `echo`
+# registration is the conventional schema-required entry, unused below.
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: smoke-multi-level
+  description: |
+    Linear 3-level propagation fixture. leaf emits -> mid reconciles +
+    emits -> root reconciles + emits, all on `never` cadence, wakes
+    driven only by ChildOutput signals.
+defaults:
+  idle_period: never
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: root
+    mandate:
+      text: multi-level-root
+    tools: []
+    children:
+      - id: mid
+        mandate:
+          text: multi-level-mid
+        tools: []
+        children:
+          - id: leaf
+            mandate:
+              text: multi-level-leaf
+            tools: []
+seed:
+  triggers:
+    - agent: root
+      at: start
+      external:
+        kind: kickoff
+        payload: {}

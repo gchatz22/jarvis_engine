@@ -387,6 +387,18 @@ jobs:
           cargo test --locked -p coral_graph --test multi_agent -- --nocapture \
             2>&1 | tee ci-logs/multi-agent-live.log
 
+      # Multi-level (root <- mid <- leaf) all-`never` propagation: a leaf
+      # output assembles the root hop-by-hop via the ChildOutput relay, with
+      # the intermediate node both receiving and firing a signal.
+      - name: Run multi_level_propagation live
+        env:
+          TEMPORAL_LIVE_TEST: "1"
+          SQLX_OFFLINE: "true"
+        run: |
+          set -o pipefail
+          cargo test --locked -p coral_graph --test multi_level_propagation -- --nocapture \
+            2>&1 | tee ci-logs/multi-level-propagation-live.log
+
       # Exercises the production worker wiring: the real `GraphStore` installed
       # as the `StructuralDbStore`, driven through `Decision::SpawnChild`, with
       # the child `agents` + `edges` rows read back from the service Postgres.

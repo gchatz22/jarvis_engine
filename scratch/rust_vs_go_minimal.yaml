@@ -1,0 +1,153 @@
+# Minimal 3-node, single-invocation graph — a first real run of the design.
+#
+# Shape: one parent synthesist + two advocate children (star topology). Each
+# child argues one side of "Rust vs Go for a high-throughput API backend"; the
+# parent reconciles their two briefs into one recommendation. This exercises
+# the whole spine end-to-end: child mints evidence -> child emits Output ->
+# ChildOutput propagates up -> parent reconciles -> parent emits a
+# provenance-cited synthesis.
+#
+# DESIGN INTENT — mandates are pure task, protocol lives elsewhere.
+# The mandates below say only WHAT each agent's slice of the question is; they
+# carry no calling-protocol rules. How an agent behaves in the loop — one
+# decision per turn, cite-or-the-runtime-rejects-you, `idle` ends the cycle,
+# fold children as they arrive, refresh-don't-terminate — is owned by the
+# shared system prompt (`decide_llm/system_prompt.md`), which every agent
+# already sees. A mandate is a markdown document describing a job, not a
+# rulebook for the machine.
+#
+# This run is therefore also a test of that split: if the graph completes with
+# these lean mandates, the system prompt is carrying the discipline. Two spots
+# to watch, both properties of the shared surface rather than the task:
+#   - Children must infer that producing citable evidence means calling their
+#     one assigned tool (`echo`, named to them in the prompt's tool catalog).
+#   - The parent must idle on its first (empty) wake with nothing yet to fold.
+#     Handled here by TOPOLOGY, not prose: the parent is NOT seeded, so its
+#     forced first tick is a bare ScheduledWake it can idle from; it wakes for
+#     real on the first ChildOutput.
+#
+# SINGLE INVOCATION, not continuous: every node runs `idle_period: never`, so
+# the only wakes are the child seeds and the ChildOutput signals. Nothing
+# polls; once a node finishes its cycle and idles, it sleeps until a signal.
+#
+# ZERO external dependencies: the only tool is the builtin `echo` — no Node, no
+# API keys beyond COHERE_API_KEY. A tool is needed at all because provenance is
+# non-fakeable: `write_output` rejects empty citations and the model can only
+# write under `notes/`, never `evidence/`, so a node must mint an evidence
+# record via a real tool call before it can emit. `echo` is that minimal,
+# dependency-free evidence source (a real graph would give the children a web
+# search tool instead, and nothing else about the shape would change).
+#
+# Model: Cohere `north-mini-code-1-0` on every node (routed via the `cohere/`
+# provider prefix). Run the worker built with `--features llm-cohere` and
+# COHERE_API_KEY in its environment.
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: rust-vs-go-minimal-3
+  description: |
+    Minimal single-invocation demo: two advocate children argue Rust vs Go
+    for a high-throughput API backend; the parent reconciles their briefs
+    into one balanced, provenance-cited recommendation. All nodes `never`
+    self-wake — driven only by the child seeds and ChildOutput signals.
+defaults:
+  idle_period: never
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: synthesist
+    mandate:
+      text: |
+        You own a two-sided technical decision: **Rust vs Go for a
+        high-throughput API backend.** Your job is judgment, not research —
+        you weigh the cases your two researchers make and reach a
+        recommendation a human can act on.
+
+        Two researchers report to you, each arguing one side:
+
+        - **`rust-advocate`** — the case for Rust.
+        - **`go-advocate`** — the case for Go.
+
+        They already exist and send you their briefs on their own; your role
+        is to weigh what arrives, not to recruit researchers or gather
+        sources yourself.
+
+        As their briefs come in, fold them into a single recommendation that:
+
+        - weighs both sides fairly — Rust's predictable latency and
+          compile-checked safety against Go's simplicity and speed of
+          delivery;
+        - commits to a **clear default choice** for the general
+          high-throughput-backend case; and
+        - names the **specific condition under which the other language is
+          the better call.**
+
+        Your Output is the decision itself: honest about the trade-off, but
+        decisive rather than "it depends."
+      model: cohere/north-mini-code-1-0
+    tools: []
+    children:
+      - id: rust-advocate
+        mandate:
+          text: |
+            You argue one side of a technical decision: **the case for
+            choosing Rust to build a high-throughput API backend.**
+
+            Make the strongest *honest* case for Rust at this workload. The
+            ground you own:
+
+            - **Predictable tail latency** — no garbage-collector pauses to
+              blow out your p99 under load.
+            - **Memory safety without a runtime** — the borrow checker gives
+              you safety with no GC and no VM overhead.
+            - **Concurrency the compiler checks** — data races are a compile
+              error, not a 3 a.m. production incident.
+
+            A credible brief is honest about the costs too: compile times and
+            the ownership learning curve are real, and you should name them
+            rather than pretend they don't exist.
+
+            Stay strictly on the Rust side of this debate — your sibling
+            makes the case for Go, and your parent weighs you both. Your
+            deliverable is a short, decisive brief a synthesist can set
+            against the opposing case.
+          model: cohere/north-mini-code-1-0
+        tools: [echo]
+      - id: go-advocate
+        mandate:
+          text: |
+            You argue one side of a technical decision: **the case for
+            choosing Go to build a high-throughput API backend.**
+
+            Make the strongest *honest* case for Go at this workload. The
+            ground you own:
+
+            - **Simplicity that ships** — a small language and fast compiles
+              mean features land quickly and new engineers are productive in
+              days.
+            - **Concurrency built into the language** — goroutines and
+              channels make a high-concurrency server the straightforward
+              path, not the hard one.
+            - **A battle-tested server stack** — `net/http`, the standard
+              library, and a deep bench of production and ops tooling.
+
+            A credible brief is honest about the costs too: garbage-collection
+            latency tails under heavy load and a less expressive type system
+            are real trade-offs — name them.
+
+            Stay strictly on the Go side of this debate — your sibling makes
+            the case for Rust, and your parent weighs you both. Your
+            deliverable is a short, decisive brief a synthesist can set
+            against the opposing case.
+          model: cohere/north-mini-code-1-0
+        tools: [echo]
+seed:
+  triggers:
+    - agent: rust-advocate
+      at: start
+      external: { kind: kickoff, payload: {} }
+    - agent: go-advocate
+      at: start
+      external: { kind: kickoff, payload: {} }

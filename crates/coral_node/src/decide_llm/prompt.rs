@@ -17,10 +17,11 @@
 //! with the default `BTreeMap`-backed `serde_json::Map`, emitting keys in
 //! sorted order. That stability is what makes the snapshot tests viable.
 
+use crate::agent_ref::AgentRef;
 use crate::decision::{Decision, FsIndex, ReconcileSource, Remainder, Seed, Session, Step};
-use crate::mandate::Mandate;
+use crate::mandate::{Mandate, OutputId};
 use crate::model_client::Message;
-use crate::trigger::Trigger;
+use crate::trigger::{HumanOp, Trigger};
 
 /// The standing system prompt — agent identity, operating principles, and the
 /// hard rules — authored as markdown in `system_prompt.md`. `{{MANDATE}}` and
@@ -80,46 +81,154 @@ fn render_tool_catalog(tools: &[String]) -> String {
     )
 }
 
-/// Render the trigger window as a bulleted list.
+/// A wake carrying only `ScheduledWake` is a refresh, not a reaction; this is
+/// the whole briefing for that case.
+const SCHEDULED_REFRESH: &str =
+    "# Wake — scheduled refresh, no new signals. Re-check your slice and refresh your Output.";
+
+/// Render the wake briefing: a readable, grouped overview of what woke the
+/// agent, derived entirely from the drained trigger batch.
 ///
-/// Most variants are serialized via their existing serde shape — the same
-/// shape the kernel uses on the wire — so the prompt cannot drift from the
-/// typed enum without a serde test failure elsewhere.
-///
-/// Cross-agent variants (`ChildOutput`, `ChildRetired`) render as
-/// human-readable prose instead: the model needs the child's name as a
-/// first-class signal, and an opaque `External`-shaped JSON blob buries that
-/// name behind a nested struct.
+/// A lone signal — the common wake — renders as one terse line; a batch groups
+/// by class in priority order (human > external > child) with per-class counts,
+/// and each child-output entry carries its exact `reconcile_children` source
+/// object verbatim so the model can copy it into a `ReconcileChildren` decision.
+/// The briefing surfaces and organizes; it does not restate policy the system
+/// prompt already owns (e.g. that human input is authoritative). A wake with
+/// only `ScheduledWake` is a scheduled refresh; any other trigger makes it
+/// event-driven. `render` only calls this for a non-empty batch.
 fn render_triggers(triggers: &[Trigger]) -> String {
-    let mut s = format!("# Triggers ({})", triggers.len());
-    for t in triggers {
-        s.push_str("\n\n- ");
-        match t {
-            Trigger::ChildOutput {
-                child_ref,
-                agent_name,
-                output_id,
-            } => {
-                let source = serde_json::to_string(&ReconcileSource {
-                    child_ref: child_ref.clone(),
-                    output_id: output_id.clone(),
-                })
-                .expect("ReconcileSource serializes");
-                s.push_str(&format!(
-                    "Child output: {agent_name} emitted {output_id}. To fold it, pass this exact object in the `reconcile_children` `sources` array: {source}"
-                ));
-            }
-            Trigger::ChildRetired {
-                agent_name, reason, ..
-            } => {
-                s.push_str(&format!("Child retired: {agent_name} ({reason})"));
-            }
-            _ => {
-                s.push_str(&serde_json::to_string(t).expect("Trigger serializes"));
+    let humans: Vec<&Trigger> = triggers
+        .iter()
+        .filter(|t| matches!(t, Trigger::HumanOverride { .. }))
+        .collect();
+    let externals: Vec<&Trigger> = triggers
+        .iter()
+        .filter(|t| matches!(t, Trigger::External { .. }))
+        .collect();
+    let children: Vec<&Trigger> = triggers
+        .iter()
+        .filter(|t| {
+            matches!(
+                t,
+                Trigger::ChildOutput { .. } | Trigger::ChildRetired { .. }
+            )
+        })
+        .collect();
+    let signal_count = humans.len() + externals.len() + children.len();
+
+    if signal_count == 0 {
+        return SCHEDULED_REFRESH.to_string();
+    }
+    if let [only] = triggers {
+        return render_single_signal(only);
+    }
+
+    let has_scheduled = signal_count < triggers.len();
+    let noun = if signal_count == 1 {
+        "signal"
+    } else {
+        "signals"
+    };
+    let also = if has_scheduled {
+        "; a scheduled refresh was also due"
+    } else {
+        ""
+    };
+    let mut s = format!("# Wake — event-driven ({signal_count} {noun}{also})");
+
+    if !humans.is_empty() {
+        s.push_str(&format!("\n\nHuman override ({}):", humans.len()));
+        for h in &humans {
+            if let Trigger::HumanOverride { op } = h {
+                s.push_str(&format!("\n  - {}", human_detail(op)));
             }
         }
     }
+    if !externals.is_empty() {
+        s.push_str(&format!("\n\nExternal ({}):", externals.len()));
+        for e in &externals {
+            if let Trigger::External { kind, payload } = e {
+                s.push_str(&format!("\n  - {}", external_detail(kind, payload)));
+            }
+        }
+    }
+    if !children.is_empty() {
+        s.push_str(&format!("\n\nChild reports ({}):", children.len()));
+        for c in &children {
+            s.push_str(&format!("\n  - {}", child_detail(c)));
+        }
+    }
     s
+}
+
+/// One-line briefing for the common single-signal wake.
+fn render_single_signal(t: &Trigger) -> String {
+    match t {
+        Trigger::ScheduledWake => SCHEDULED_REFRESH.to_string(),
+        Trigger::HumanOverride { op } => format!("# Wake — human override: {}", human_detail(op)),
+        Trigger::External { kind, payload } => {
+            format!(
+                "# Wake — external signal {}",
+                external_detail(kind, payload)
+            )
+        }
+        Trigger::ChildOutput {
+            child_ref,
+            agent_name,
+            output_id,
+        } => format!(
+            "# Wake — child report: {agent_name} emitted an output. \
+             Reconcile it — `reconcile_children` source: {}",
+            reconcile_source_json(child_ref, output_id)
+        ),
+        Trigger::ChildRetired {
+            agent_name, reason, ..
+        } => format!("# Wake — child retired: {agent_name} ({reason})."),
+    }
+}
+
+/// The inner override JSON (`HumanOp` is a transparent newtype).
+fn human_detail(op: &HumanOp) -> String {
+    serde_json::to_string(op).expect("HumanOp serializes")
+}
+
+/// `"kind": payload` — the external's kind quoted, then its opaque payload. The
+/// kernel has no action to point to here; the payload's meaning is vertical.
+fn external_detail(kind: &str, payload: &serde_json::Value) -> String {
+    format!(
+        "\"{kind}\": {}",
+        serde_json::to_string(payload).expect("payload serializes")
+    )
+}
+
+/// One child entry for the grouped briefing. Outputs carry their exact
+/// `reconcile_children` source object verbatim; retirements name the reason.
+fn child_detail(t: &Trigger) -> String {
+    match t {
+        Trigger::ChildOutput {
+            child_ref,
+            agent_name,
+            output_id,
+        } => format!(
+            "{agent_name} emitted an output; reconcile source: {}",
+            reconcile_source_json(child_ref, output_id)
+        ),
+        Trigger::ChildRetired {
+            agent_name, reason, ..
+        } => format!("{agent_name} retired ({reason})"),
+        _ => unreachable!("child_detail called on a non-child trigger"),
+    }
+}
+
+/// The exact `ReconcileSource` object the model copies into a
+/// `ReconcileChildren` decision to fold a child output.
+fn reconcile_source_json(child_ref: &AgentRef, output_id: &OutputId) -> String {
+    serde_json::to_string(&ReconcileSource {
+        child_ref: child_ref.clone(),
+        output_id: output_id.clone(),
+    })
+    .expect("ReconcileSource serializes")
 }
 
 /// Render the FS index: filenames only (pointers), never bodies. This is the
@@ -434,25 +543,53 @@ mod tests {
         );
     }
 
-    // ---- trigger snapshots ----------------------------------------------
+    // ---- wake-briefing snapshots ----------------------------------------
 
     #[test]
-    fn snapshot_single_trigger() {
+    fn single_scheduled_wake_reads_as_a_scheduled_refresh() {
         let session = Session::new(seed_with(vec![Trigger::ScheduledWake], FsIndex::default()));
         let msgs = render(&session);
         // system + triggers + index.
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[1].role, Role::User);
+        assert_eq!(text(&msgs[1]), SCHEDULED_REFRESH);
+    }
+
+    #[test]
+    fn single_external_degrades_to_one_line() {
+        let session = Session::new(seed_with(
+            vec![Trigger::External {
+                kind: "webhook".into(),
+                payload: json!({"x": 1}),
+            }],
+            FsIndex::default(),
+        ));
+        let msgs = render(&session);
         assert_eq!(
             text(&msgs[1]),
-            "# Triggers (1)\n\
-             \n\
-             - {\"type\":\"scheduled_wake\"}"
+            "# Wake — external signal \"webhook\": {\"x\":1}"
         );
     }
 
     #[test]
-    fn snapshot_mixed_triggers() {
+    fn single_human_override_degrades_to_one_line() {
+        let session = Session::new(seed_with(
+            vec![Trigger::HumanOverride {
+                op: HumanOp::new(json!({"action": "pause"})),
+            }],
+            FsIndex::default(),
+        ));
+        let msgs = render(&session);
+        assert_eq!(
+            text(&msgs[1]),
+            "# Wake — human override: {\"action\":\"pause\"}"
+        );
+    }
+
+    #[test]
+    fn batch_groups_by_class_and_notes_a_concurrent_scheduled_refresh() {
+        // Priority-ordered groups (human > external), and the header flags that
+        // the idle timer had also come due this wake.
         let session = Session::new(seed_with(
             vec![
                 Trigger::ScheduledWake,
@@ -469,13 +606,28 @@ mod tests {
         let msgs = render(&session);
         assert_eq!(
             text(&msgs[1]),
-            "# Triggers (3)\n\
-             \n\
-             - {\"type\":\"scheduled_wake\"}\n\
-             \n\
-             - {\"type\":\"external\",\"kind\":\"webhook\",\"payload\":{\"x\":1}}\n\
-             \n\
-             - {\"type\":\"human_override\",\"op\":{\"action\":\"pause\"}}"
+            "# Wake — event-driven (2 signals; a scheduled refresh was also due)\n\nHuman override (1):\n  - {\"action\":\"pause\"}\n\nExternal (1):\n  - \"webhook\": {\"x\":1}"
+        );
+    }
+
+    #[test]
+    fn batch_without_a_scheduled_wake_omits_the_refresh_note() {
+        let session = Session::new(seed_with(
+            vec![
+                Trigger::HumanOverride {
+                    op: HumanOp::new(json!({"action": "pause"})),
+                },
+                Trigger::External {
+                    kind: "webhook".into(),
+                    payload: json!({"x": 1}),
+                },
+            ],
+            FsIndex::default(),
+        ));
+        let msgs = render(&session);
+        assert_eq!(
+            text(&msgs[1]),
+            "# Wake — event-driven (2 signals)\n\nHuman override (1):\n  - {\"action\":\"pause\"}\n\nExternal (1):\n  - \"webhook\": {\"x\":1}"
         );
     }
 
@@ -487,7 +639,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_child_output_trigger() {
+    fn single_child_output_degrades_to_one_line_with_verbatim_source() {
         let output_id = OutputId::from_hex("ab".repeat(32));
         let session = Session::new(seed_with(
             vec![Trigger::ChildOutput {
@@ -500,20 +652,60 @@ mod tests {
         let msgs = render(&session);
         let source = serde_json::to_string(&ReconcileSource {
             child_ref: child_ref(),
-            output_id: output_id.clone(),
+            output_id,
         })
         .expect("ReconcileSource serializes");
         assert_eq!(
             text(&msgs[1]),
             format!(
-                "# Triggers (1)\n\n- Child output: fda_scraper emitted {output_id}. \
-                 To fold it, pass this exact object in the `reconcile_children` `sources` array: {source}"
+                "# Wake — child report: fda_scraper emitted an output. \
+                 Reconcile it — `reconcile_children` source: {source}"
             )
         );
     }
 
     #[test]
-    fn snapshot_child_retired_trigger() {
+    fn batch_preserves_verbatim_reconcile_source_for_each_child_output() {
+        let out_a = OutputId::from_hex("ab".repeat(32));
+        let out_b = OutputId::from_hex("cd".repeat(32));
+        let session = Session::new(seed_with(
+            vec![
+                Trigger::ChildOutput {
+                    child_ref: child_ref(),
+                    agent_name: "fda_scraper".into(),
+                    output_id: out_a.clone(),
+                },
+                Trigger::ChildOutput {
+                    child_ref: child_ref(),
+                    agent_name: "trials_watch".into(),
+                    output_id: out_b.clone(),
+                },
+            ],
+            FsIndex::default(),
+        ));
+        let body = text(&render(&session)[1]).to_string();
+        let src_a = serde_json::to_string(&ReconcileSource {
+            child_ref: child_ref(),
+            output_id: out_a,
+        })
+        .unwrap();
+        let src_b = serde_json::to_string(&ReconcileSource {
+            child_ref: child_ref(),
+            output_id: out_b,
+        })
+        .unwrap();
+        assert!(body.starts_with("# Wake — event-driven (2 signals)"));
+        assert!(body.contains("Child reports (2):"));
+        assert!(body.contains(&format!(
+            "fda_scraper emitted an output; reconcile source: {src_a}"
+        )));
+        assert!(body.contains(&format!(
+            "trials_watch emitted an output; reconcile source: {src_b}"
+        )));
+    }
+
+    #[test]
+    fn single_child_retired_degrades_to_one_line() {
         let session = Session::new(seed_with(
             vec![Trigger::ChildRetired {
                 child_ref: child_ref(),
@@ -525,14 +717,14 @@ mod tests {
         let msgs = render(&session);
         assert_eq!(
             text(&msgs[1]),
-            "# Triggers (1)\n\
-             \n\
-             - Child retired: fda_scraper (mandate satisfied)"
+            "# Wake — child retired: fda_scraper (mandate satisfied)."
         );
     }
 
     #[test]
-    fn child_output_trigger_is_distinct_from_external() {
+    fn child_report_is_visually_distinct_from_a_masquerading_external() {
+        // A real child output must not read the same as an external webhook
+        // whose `kind` merely happens to be "child_output".
         let output_id = OutputId::from_hex("ab".repeat(32));
         let child = Session::new(seed_with(
             vec![Trigger::ChildOutput {
@@ -551,9 +743,10 @@ mod tests {
         ));
         let child_txt = text(&render(&child)[1]).to_string();
         let external_txt = text(&render(&external)[1]).to_string();
-        assert!(!child_txt.contains("\"type\":\"child_output\""));
-        assert!(external_txt.contains("\"type\":\"external\""));
-        assert!(child_txt.contains("Child output: fda_scraper"));
+        assert!(child_txt.contains("child report: fda_scraper"));
+        assert!(!child_txt.contains("external signal"));
+        assert!(external_txt.contains("external signal \"child_output\""));
+        assert!(!external_txt.contains("child report"));
         assert_ne!(child_txt, external_txt);
     }
 
@@ -654,7 +847,7 @@ mod tests {
         let msgs = render(&session);
         assert_eq!(msgs.len(), 4);
         assert_eq!(msgs[0].role, Role::System);
-        assert!(text(&msgs[1]).starts_with("# Triggers"));
+        assert!(text(&msgs[1]).starts_with("# Wake"));
         assert!(text(&msgs[2]).starts_with("# Your files (index)"));
         assert!(text(&msgs[3]).starts_with("# Steps so far this cycle"));
     }

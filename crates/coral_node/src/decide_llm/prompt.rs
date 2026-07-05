@@ -440,10 +440,10 @@ mod tests {
         );
         for rule in [
             "One step per turn.",
-            "Pull what you need.",
+            "Pull only what a step needs.",
             "Cite your evidence.",
             "Refresh, don't stop.",
-            "Idle ends the cycle.",
+            "Idle only when your Output reflects the current world.",
             "Fold child reports",
             "Keep your status note current.",
         ] {

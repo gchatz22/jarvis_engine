@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use super::{
     effective_model, CallStats, CompleteRequest, CompleteResponse, ContentBlock, ModelClient,
-    ModelError, Role, ToolCall, Usage, Vendor,
+    ModelError, Role, ToolCall, ToolSpec, Usage, Vendor,
 };
 
 /// Default model identifier. Used when neither `MODEL_ENV` nor
@@ -130,7 +130,15 @@ impl ModelClient for CohereClient {
         if status != 200 {
             return Err(map_status_error(status, &bytes));
         }
-        let parsed = parse_response(&bytes)?;
+        let mut parsed = parse_response(&bytes)?;
+        // When the request flattened the granted runtime tools into
+        // first-class functions, the model called them by their own names.
+        // Collapse those back into the kernel's `call_tool` shape so
+        // `parse_decision` and `Decision::CallTools` never see the vendor
+        // detail.
+        if !req.runtime_tools.is_empty() {
+            collapse_runtime_calls(&mut parsed, &req.runtime_tools);
+        }
         let stats = CallStats {
             usage: parsed.usage,
             latency_ms,
@@ -259,10 +267,29 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
     // assistant text. `"OFF"` disables that markup; the engine carries its
     // own provenance via `Output.evidence`.
     body.insert("citation_options".into(), json!({ "mode": "OFF" }));
+
+    // Flatten mode: when the request carries granted runtime tools, offer
+    // them as first-class typed functions in place of the generic `call_tool`
+    // wrapper and turn on `strict_tools` (grammar-constrained decoding) — the
+    // shape a weak model needs to emit valid tool calls. `strict_tools`
+    // validates every offered function, so it requires the whole surface to
+    // be strict-compatible (see decision_tools).
+    let flatten = !req.runtime_tools.is_empty();
+    if flatten {
+        body.insert("strict_tools".into(), json!(true));
+    }
     body.insert("messages".into(), Value::Array(messages));
-    if !req.tools.is_empty() {
-        let tools: Vec<Value> = req
-            .tools
+
+    let offered: Vec<&ToolSpec> = if flatten {
+        req.runtime_tools
+            .iter()
+            .chain(req.tools.iter().filter(|t| t.name != "call_tool"))
+            .collect()
+    } else {
+        req.tools.iter().collect()
+    };
+    if !offered.is_empty() {
+        let tools: Vec<Value> = offered
             .iter()
             .map(|t| {
                 json!({
@@ -278,6 +305,38 @@ pub fn build_body(req: &CompleteRequest, model: &str) -> Value {
         body.insert("tools".into(), Value::Array(tools));
     }
     Value::Object(body)
+}
+
+/// Collapse first-class runtime-tool calls back into the kernel's `call_tool`
+/// shape. In flatten mode the model calls a granted tool by its own name
+/// (e.g. `web_search`); the kernel expects a `call_tool` whose arguments name
+/// the tool and carry a `claim_seed`. Rewrite matching calls in both
+/// `tool_calls` and `content` (they mirror each other) so downstream
+/// `parse_decision` is unaware flattening happened. `claim_seed` is minted
+/// from the vendor tool-use id — opaque, unique, and never authored by the
+/// model; the agent cites evidence by path, not by seed.
+fn collapse_runtime_calls(parsed: &mut ParsedComplete, runtime_tools: &[ToolSpec]) {
+    let is_runtime = |name: &str| runtime_tools.iter().any(|t| t.name == name);
+    for tc in &mut parsed.tool_calls {
+        if is_runtime(&tc.name) {
+            let seed = tc.id.clone();
+            let tool_name = std::mem::take(&mut tc.name);
+            let args = std::mem::replace(&mut tc.arguments, Value::Null);
+            tc.arguments = json!({ "name": tool_name, "args": args, "claim_seed": seed });
+            tc.name = "call_tool".to_string();
+        }
+    }
+    for block in &mut parsed.content {
+        if let ContentBlock::ToolUse { id, name, input } = block {
+            if is_runtime(name) {
+                let seed = id.clone();
+                let tool_name = std::mem::take(name);
+                let args = std::mem::replace(input, Value::Null);
+                *input = json!({ "name": tool_name, "args": args, "claim_seed": seed });
+                *name = "call_tool".to_string();
+            }
+        }
+    }
 }
 
 /// Concatenate `Text` blocks into a single string. Cohere's `system` and
@@ -904,6 +963,139 @@ mod tests {
         // A 422 that isn't an invalid-tool-generation is just another 4xx.
         let e = map_status_error(422, b"{\"message\":\"unprocessable\"}");
         assert!(matches!(e, ModelError::Other(_)));
+    }
+
+    /// A minimal strict-compatible tool spec named `name`.
+    fn tool_spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: format!("{name} tool"),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" } },
+                "required": ["q"]
+            }),
+        }
+    }
+
+    #[test]
+    fn build_body_flattens_runtime_tools_and_enables_strict() {
+        let req = CompleteRequest {
+            messages: vec![Message::user("go")],
+            tools: vec![tool_spec("call_tool"), tool_spec("write_output")],
+            runtime_tools: vec![tool_spec("web_search")],
+            model: None,
+            options: CompleteOptions::default(),
+        };
+        let body = build_body(&req, "m");
+        assert_eq!(body["strict_tools"], json!(true));
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"web_search"),
+            "the granted runtime tool is offered first-class: {names:?}"
+        );
+        assert!(names.contains(&"write_output"), "other decision tools stay");
+        assert!(
+            !names.contains(&"call_tool"),
+            "the generic call_tool wrapper is replaced by the flattened tool"
+        );
+    }
+
+    #[test]
+    fn build_body_without_runtime_tools_keeps_call_tool_and_omits_strict() {
+        let req = CompleteRequest {
+            messages: vec![Message::user("go")],
+            tools: vec![tool_spec("call_tool"), tool_spec("write_output")],
+            runtime_tools: vec![],
+            model: None,
+            options: CompleteOptions::default(),
+        };
+        let body = build_body(&req, "m");
+        assert!(
+            body.get("strict_tools").is_none(),
+            "strict_tools stays off when not flattening"
+        );
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            names.contains(&"call_tool"),
+            "call_tool preserved: {names:?}"
+        );
+    }
+
+    #[test]
+    fn collapse_rewrites_runtime_call_into_call_tool_shape() {
+        use crate::decide_llm::parse_decision;
+        use crate::decision::Decision;
+        let mut parsed = ParsedComplete {
+            content: vec![ContentBlock::ToolUse {
+                id: "tc_1".into(),
+                name: "web_search".into(),
+                input: json!({ "query": "rust" }),
+            }],
+            tool_calls: vec![ToolCall {
+                id: "tc_1".into(),
+                name: "web_search".into(),
+                arguments: json!({ "query": "rust" }),
+            }],
+            usage: Usage::default(),
+        };
+        collapse_runtime_calls(&mut parsed, &[tool_spec("web_search")]);
+
+        let tc = &parsed.tool_calls[0];
+        assert_eq!(tc.name, "call_tool");
+        assert_eq!(tc.arguments["name"], json!("web_search"));
+        assert_eq!(tc.arguments["args"], json!({ "query": "rust" }));
+        assert_eq!(
+            tc.arguments["claim_seed"],
+            json!("tc_1"),
+            "claim_seed is minted from the vendor tool-use id"
+        );
+        match &parsed.content[0] {
+            ContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "call_tool", "content mirrors the collapsed call");
+                assert_eq!(input["name"], json!("web_search"));
+            }
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
+
+        // The parser is unaware flattening happened: it sees a call_tool.
+        match parse_decision(&parsed.tool_calls).unwrap() {
+            Decision::CallTools { calls } => {
+                assert_eq!(calls[0].name, "web_search");
+                assert_eq!(calls[0].claim_seed.as_str(), "tc_1");
+            }
+            other => panic!("expected CallTools, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collapse_leaves_decision_tool_calls_untouched() {
+        let mut parsed = ParsedComplete {
+            content: vec![],
+            tool_calls: vec![ToolCall {
+                id: "tc_2".into(),
+                name: "write_output".into(),
+                arguments: json!({ "body": "x", "citations": [] }),
+            }],
+            usage: Usage::default(),
+        };
+        collapse_runtime_calls(&mut parsed, &[tool_spec("web_search")]);
+        // write_output is a decision tool, not a granted runtime tool.
+        assert_eq!(parsed.tool_calls[0].name, "write_output");
+        assert_eq!(
+            parsed.tool_calls[0].arguments,
+            json!({ "body": "x", "citations": [] })
+        );
     }
 
     #[test]

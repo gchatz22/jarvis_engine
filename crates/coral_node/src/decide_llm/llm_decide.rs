@@ -150,7 +150,7 @@ impl Decide for LlmDecide {
         // a system-role corrective. The model sees its full failure
         // history, not just the most recent miss.
         let mut messages = prompt::render(session);
-        let mut errors: Vec<DecisionParseError> = Vec::new();
+        let mut errors: Vec<AttemptFailure> = Vec::new();
         let total_attempts = MAX_DECISION_RETRIES + 1;
 
         self.tick_stats
@@ -159,7 +159,8 @@ impl Decide for LlmDecide {
             .clear();
 
         for attempt in 0..total_attempts {
-            let resp = client
+            let is_last = attempt + 1 == total_attempts;
+            let resp = match client
                 .complete(CompleteRequest {
                     messages: messages.clone(),
                     tools: tools.clone(),
@@ -167,7 +168,27 @@ impl Decide for LlmDecide {
                     model: model.clone(),
                 })
                 .await
-                .map_err(model_err_to_anyhow)?;
+            {
+                Ok(resp) => resp,
+                // A rejected tool call is the server-side twin of a parse
+                // failure: the provider refused the model's generation, so
+                // nothing came back to echo. Fold it into the same bounded
+                // retry — a resample under a corrective nudge usually clears
+                // it — rather than failing the whole tick on one bad sample.
+                Err(ModelError::InvalidToolGeneration(msg)) => {
+                    if !is_last {
+                        messages.push(Message {
+                            role: Role::System,
+                            content: vec![ContentBlock::Text {
+                                text: rejected_tool_call_corrective_text(),
+                            }],
+                        });
+                    }
+                    errors.push(AttemptFailure::ProviderRejectedToolCall(msg));
+                    continue;
+                }
+                Err(e) => return Err(model_err_to_anyhow(e)),
+            };
 
             debug!(
                 vendor = resp.stats.vendor.as_str(),
@@ -189,7 +210,6 @@ impl Decide for LlmDecide {
                     return Ok(d);
                 }
                 Err(e) => {
-                    let is_last = attempt + 1 == total_attempts;
                     if !is_last {
                         // When the bad assistant turn contains K `tool_use`
                         // blocks (parallel-tool path), both vendor APIs
@@ -212,7 +232,7 @@ impl Decide for LlmDecide {
                             }],
                         });
                     }
-                    errors.push(e);
+                    errors.push(AttemptFailure::Parse(e));
                 }
             }
         }
@@ -221,7 +241,7 @@ impl Decide for LlmDecide {
         // the cost the tick burned before going `Unhealthy`.
         self.emit_tick_summary();
         Err(anyhow!(
-            "LlmDecide: parse failed on all {} attempt(s). {}",
+            "LlmDecide: no valid decision on all {} attempt(s). {}",
             total_attempts,
             format_attempt_errors(&errors)
         ))
@@ -244,10 +264,32 @@ impl LlmDecide {
     }
 }
 
-/// Render a list of per-attempt parse errors into a single string for the
-/// final `anyhow!` payload. Each entry is prefixed `attempt N` so a reader
-/// can correlate it with the upstream call count.
-fn format_attempt_errors(errors: &[DecisionParseError]) -> String {
+/// Why one decide attempt failed to yield a usable `Decision`. Either the
+/// provider returned tool calls that didn't parse, or it rejected the
+/// generation outright (Cohere's 422 `INVALID_TOOL_GENERATION`) — the
+/// server-side twin of a parse failure. Both drive the same bounded
+/// retry-with-correction; they differ only in the corrective text and in
+/// whether there is an assistant turn to echo.
+enum AttemptFailure {
+    Parse(DecisionParseError),
+    ProviderRejectedToolCall(String),
+}
+
+impl std::fmt::Display for AttemptFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttemptFailure::Parse(e) => write!(f, "{e}"),
+            AttemptFailure::ProviderRejectedToolCall(msg) => {
+                write!(f, "provider rejected tool call: {msg}")
+            }
+        }
+    }
+}
+
+/// Render a list of per-attempt failures into a single string for the final
+/// `anyhow!` payload. Each entry is prefixed `attempt N` so a reader can
+/// correlate it with the upstream call count.
+fn format_attempt_errors(errors: &[AttemptFailure]) -> String {
     errors
         .iter()
         .enumerate()
@@ -331,6 +373,19 @@ fn corrective_system_text(err: &DecisionParseError) -> String {
          parallel batch, with schema-correct arguments. Do not mix `call_tool` \
          with another decision tool in the same response."
     )
+}
+
+/// Corrective for a provider-rejected tool call (e.g. a 422). No assistant
+/// turn came back, so this is the only signal replayed before the resample:
+/// there is nothing to echo, just the nudge to emit a valid tool call.
+fn rejected_tool_call_corrective_text() -> String {
+    "The provider rejected your previous response as an invalid tool call. \
+     Reply by calling exactly one decision tool \
+     (`read`, `list`, `search`, `write_output`, `rewrite_fs`, `idle`) \
+     OR one or more `call_tool` blocks dispatched together as a single \
+     parallel batch, with schema-correct arguments. Do not mix `call_tool` \
+     with another decision tool in the same response."
+        .to_string()
 }
 
 /// Wrap a typed `ModelError` into the `anyhow::Error` the `Decide` trait
@@ -832,6 +887,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_tool_generation_folds_into_bounded_retry_with_correction() {
+        // The provider rejects the model's tool call (Cohere 422). Nothing
+        // comes back to echo, so the loop replays only a corrective system
+        // message and resamples — a rejected call is the server-side twin of
+        // a parse failure, not a fatal error that should kill the tick.
+        let mock = MockModelClient::new(vec![
+            MockOutcome::Err(ModelError::InvalidToolGeneration(
+                "HTTP 422: INVALID_TOOL_GENERATION".into(),
+            )),
+            MockOutcome::Resp(resp_with_tool_calls(vec![good_idle_call()])),
+        ]);
+        let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
+
+        let dec = decide.decide(&empty_session()).await.unwrap();
+        assert_eq!(
+            dec,
+            Decision::Idle {
+                next_after: Duration::from_millis(1000),
+            }
+        );
+
+        let seen = mock.seen();
+        assert_eq!(
+            seen.len(),
+            2,
+            "the rejected call must be retried, not fatal"
+        );
+        let retry = &seen[1];
+        let has_corrective = retry.messages.iter().any(|m| {
+            m.role == Role::System
+                && m.content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::Text { text } if text.contains("rejected")))
+        });
+        assert!(
+            has_corrective,
+            "retry must carry the rejected-tool-call corrective"
+        );
+        // The fold appends exactly the corrective and echoes no assistant
+        // turn (there was none to echo).
+        assert_eq!(
+            retry.messages.len(),
+            seen[0].messages.len() + 1,
+            "fold appends only the corrective system message, not an echo"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_generation_on_every_attempt_returns_bounded_err() {
+        // Even if every sample is rejected, the loop gives up after its
+        // bounded attempts rather than hanging or wedging under retry — the
+        // child fails this tick and lives to wake again.
+        let total_attempts = MAX_DECISION_RETRIES + 1;
+        let script: Vec<MockOutcome> = (0..total_attempts)
+            .map(|_| MockOutcome::Err(ModelError::InvalidToolGeneration("HTTP 422".into())))
+            .collect();
+        let mock = MockModelClient::new(script);
+        let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
+
+        let err = decide.decide(&empty_session()).await.unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains(&format!("all {total_attempts} attempt")),
+            "got: {s}"
+        );
+        assert!(s.contains("provider rejected tool call"), "got: {s}");
+        assert_eq!(
+            mock.seen().len(),
+            total_attempts,
+            "attempts must be bounded, not unbounded"
+        );
+    }
+
+    #[tokio::test]
     async fn vendor_transport_error_bubbles_immediately_without_retry() {
         let mock = MockModelClient::new(vec![MockOutcome::Err(ModelError::Transport(
             "DNS failure".into(),
@@ -1056,7 +1185,7 @@ mod tests {
         ]);
         let decide = LlmDecide::new(mock, CompleteOptions::default());
         let err = decide.decide(&empty_session()).await.unwrap_err();
-        assert!(err.to_string().contains("parse failed"));
+        assert!(err.to_string().contains("no valid decision"));
 
         let totals = decide.last_tick_totals();
         assert_eq!(totals.calls, 2);

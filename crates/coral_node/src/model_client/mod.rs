@@ -249,6 +249,13 @@ pub enum ModelError {
     /// Missing or invalid credentials (HTTP 401 / 403).
     #[error("auth error: {0}")]
     Auth(String),
+    /// The provider rejected the model's tool call as invalid (e.g. Cohere's
+    /// HTTP 422 `INVALID_TOOL_GENERATION`). Kept distinct from `Other`
+    /// because it is non-deterministic: a resample or a corrective nudge can
+    /// clear it, so callers treat it like a parse failure, not a permanent
+    /// 4xx. Collapsing it into `Other` would make it look un-retryable.
+    #[error("invalid tool generation: {0}")]
+    InvalidToolGeneration(String),
     /// Anything else — typically a 4xx with a vendor-specific shape.
     #[error("model error: {0}")]
     Other(String),

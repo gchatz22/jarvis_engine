@@ -408,8 +408,23 @@ pub fn map_status_error(status: u16, body: &[u8]) -> ModelError {
         401 | 403 => ModelError::Auth(format!("HTTP {status}: {snippet}")),
         429 => ModelError::RateLimit(format!("HTTP {status}: {snippet}")),
         500..=599 => ModelError::Transport(format!("HTTP {status}: {snippet}")),
+        _ if is_invalid_tool_generation(body) => {
+            ModelError::InvalidToolGeneration(format!("HTTP {status}: {snippet}"))
+        }
         _ => ModelError::Other(format!("HTTP {status}: {snippet}")),
     }
+}
+
+/// True when an error body carries Cohere's `INVALID_TOOL_GENERATION`
+/// discriminator — the provider rejected the model's tool call. Matched on
+/// the machine-readable `error_type` field rather than the prose `message`
+/// so it survives wording changes, and kept separate from `Other` because
+/// it is resample-fixable (see [`ModelError::InvalidToolGeneration`]).
+fn is_invalid_tool_generation(body: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    v.get("error_type").and_then(Value::as_str) == Some("INVALID_TOOL_GENERATION")
 }
 
 #[cfg(test)]
@@ -863,6 +878,25 @@ mod tests {
         assert!(matches!(e, ModelError::Other(_)));
         assert!(e.to_string().contains("400"));
         assert!(e.to_string().contains("bad request"));
+    }
+
+    #[test]
+    fn map_status_422_with_invalid_tool_generation_gets_its_own_variant() {
+        // Cohere rejects the model's tool call server-side; the discriminator
+        // rides `error_type`, not the prose message. This must NOT collapse
+        // into `Other`, or the decide loop can't tell it apart from a
+        // permanent 4xx and won't retry it.
+        let body = br#"{"error_type":"INVALID_TOOL_GENERATION","id":"x","message":"invalid tool generation"}"#;
+        let e = map_status_error(422, body);
+        assert!(matches!(e, ModelError::InvalidToolGeneration(_)));
+        assert!(e.to_string().contains("422"));
+    }
+
+    #[test]
+    fn map_status_422_without_the_discriminator_stays_other() {
+        // A 422 that isn't an invalid-tool-generation is just another 4xx.
+        let e = map_status_error(422, b"{\"message\":\"unprocessable\"}");
+        assert!(matches!(e, ModelError::Other(_)));
     }
 
     #[test]

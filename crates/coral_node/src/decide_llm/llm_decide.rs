@@ -268,9 +268,21 @@ fn format_attempt_errors(errors: &[DecisionParseError]) -> String {
 /// every content block verbatim — the parser already failed, so trimming
 /// or pretty-printing is the wrong layer.
 fn assistant_echo(content: &[ContentBlock]) -> Message {
+    // A model can return nothing at all. Echoing an empty assistant turn
+    // back on retry both drops the "you produced no decision" signal and,
+    // on vendors that reject content-less assistant messages (Cohere 400s),
+    // makes the recovery request itself unsendable. Stand in a placeholder
+    // so the turn is non-empty and the corrective has something to attach to.
+    let content = if content.is_empty() {
+        vec![ContentBlock::Text {
+            text: "(model returned no output)".to_string(),
+        }]
+    } else {
+        content.to_vec()
+    };
     Message {
         role: Role::Assistant,
-        content: content.to_vec(),
+        content,
     }
 }
 
@@ -769,6 +781,54 @@ mod tests {
             }
         );
         assert_eq!(mock.seen().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn empty_model_response_is_replayed_as_a_non_empty_assistant_turn() {
+        // A model can return a wholly empty response — no text, no tool
+        // calls. The parser surfaces `NoCalls`, and the retry echoes the
+        // model's turn back. If that echo is empty, Cohere rejects the
+        // recovery request itself (HTTP 400: assistant messages need
+        // content or tool_calls), so the retry that was meant to recover
+        // instead kills the workflow. The echo must stand in a placeholder.
+        let mock = MockModelClient::new(vec![
+            MockOutcome::Resp(CompleteResponse {
+                content: vec![],
+                tool_calls: vec![],
+                usage: Usage::default(),
+                stats: stub_stats(),
+            }),
+            MockOutcome::Resp(resp_with_tool_calls(vec![good_idle_call()])),
+        ]);
+        let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
+
+        let dec = decide.decide(&empty_session()).await.unwrap();
+        assert_eq!(
+            dec,
+            Decision::Idle {
+                next_after: Duration::from_millis(1000),
+            }
+        );
+
+        let seen = mock.seen();
+        assert_eq!(seen.len(), 2);
+        let echoed = seen[1]
+            .messages
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .expect("retry must replay the model's (empty) assistant turn");
+        let text: String = echoed
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !text.is_empty(),
+            "replayed assistant turn must carry non-empty content, else the vendor rejects the recovery request"
+        );
     }
 
     #[tokio::test]

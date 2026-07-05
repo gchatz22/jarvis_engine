@@ -20,7 +20,7 @@
 use crate::agent_ref::AgentRef;
 use crate::decision::{Decision, FsIndex, ReconcileSource, Remainder, Seed, Session, Step};
 use crate::mandate::{Mandate, OutputId};
-use crate::model_client::Message;
+use crate::model_client::{Message, ToolSpec};
 use crate::trigger::{HumanOp, Trigger};
 
 /// The standing system prompt — agent identity, operating principles, and the
@@ -39,11 +39,11 @@ pub fn render(session: &Session) -> Vec<Message> {
         mandate,
         triggers,
         index,
-        runtime_tools: _,
+        runtime_tools,
     } = &session.seed;
     // At most 4: system + triggers + index + steps.
     let mut out = Vec::with_capacity(4);
-    out.push(Message::system(render_system(mandate)));
+    out.push(Message::system(render_system(mandate, runtime_tools)));
     if !triggers.is_empty() {
         out.push(Message::user(render_triggers(triggers)));
     }
@@ -61,9 +61,9 @@ pub fn render(session: &Session) -> Vec<Message> {
 /// already-trusted input, sanitized at mandate-creation time. `{{TOOLS}}` is
 /// filled before `{{MANDATE}}` so a sentinel appearing in the mandate text is
 /// left untouched.
-fn render_system(m: &Mandate) -> String {
+fn render_system(m: &Mandate, specs: &[ToolSpec]) -> String {
     SYSTEM_TEMPLATE
-        .replace("{{TOOLS}}", &render_tool_catalog(&m.tools))
+        .replace("{{TOOLS}}", &render_tool_catalog(&m.tools, specs))
         .replace("{{MANDATE}}", &m.text)
 }
 
@@ -72,14 +72,33 @@ fn render_system(m: &Mandate) -> String {
 /// this set is rejected — so the catalog states the boundary. The FS-nav
 /// steps (`read`/`list`/`search`) are always available and are not listed
 /// here.
-fn render_tool_catalog(tools: &[String]) -> String {
+///
+/// Each assigned tool is rendered with its description so the model can tell
+/// what the tool does — a bare name leaves a weak model unable to connect its
+/// one granted tool to the act of minting evidence, so it falls back to
+/// inspecting files forever. `specs` carries the resolved definitions; when it
+/// is empty (a degraded seed whose grants did not resolve) the names still
+/// state the boundary.
+fn render_tool_catalog(tools: &[String], specs: &[ToolSpec]) -> String {
     if tools.is_empty() {
         return "You have no tools assigned; you cannot call any tool (but `read`, `list`, and `search` over your own files are always available).".to_string();
     }
-    format!(
-        "You may call only these assigned tools: {}. Each may expose one or more named operations.",
-        tools.join(", ")
-    )
+    let mut out = String::from("You may call only these assigned tools:\n\n");
+    if specs.is_empty() {
+        for name in tools {
+            out.push_str(&format!("- `{name}`\n"));
+        }
+    } else {
+        for spec in specs {
+            out.push_str(&format!("- `{}` — {}\n", spec.name, spec.description));
+        }
+    }
+    out.push_str(
+        "\nCalling one of these tools is the only way to create evidence: each call writes a \
+         file under `evidence/` that you then cite in `write_output`. Inspecting files \
+         (`read`, `list`, `search`) never creates evidence — only these tools do.",
+    );
+    out
 }
 
 /// A wake carrying only `ScheduledWake` is a refresh, not a reaction; this is
@@ -360,14 +379,40 @@ mod tests {
         let msgs = render(&session);
         let sys = text(&msgs[0]);
         assert!(
-            sys.contains("You may call only these assigned tools: echo, web-search"),
+            sys.contains("You may call only these assigned tools:")
+                && sys.contains("- `echo`")
+                && sys.contains("- `web-search`"),
             "system message must list the assigned tools, got: {sys}"
+        );
+        assert!(
+            sys.contains("the only way to create evidence"),
+            "the catalog must state the evidence-minting contract, got: {sys}"
+        );
+    }
+
+    #[test]
+    fn system_message_renders_tool_descriptions_from_specs() {
+        let mut m = mandate();
+        m.tools = vec!["echo".into()];
+        let seed = Seed {
+            runtime_tools: vec![ToolSpec {
+                name: "echo".into(),
+                description: "Echo the given `msg` back — a stand-in evidence-minting tool.".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            ..Seed::new(m, vec![], FsIndex::default())
+        };
+        let msgs = render(&Session::new(seed));
+        let sys = text(&msgs[0]);
+        assert!(
+            sys.contains("- `echo` — Echo the given `msg` back"),
+            "an assigned tool must render with its description, got: {sys}"
         );
     }
 
     #[test]
     fn system_message_notes_no_tools_when_unassigned() {
-        let sys = render_system(&mandate());
+        let sys = render_system(&mandate(), &[]);
         assert!(
             sys.contains("no tools assigned"),
             "system message must state when no tools are assigned, got: {sys}"
@@ -417,7 +462,7 @@ mod tests {
 
     #[test]
     fn snapshot_system_message() {
-        let sys = render_system(&mandate());
+        let sys = render_system(&mandate(), &[]);
         assert!(
             sys.starts_with("# You are a Coral agent"),
             "system message must open with the identity header, got: {sys}"

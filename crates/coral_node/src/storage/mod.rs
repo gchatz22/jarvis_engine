@@ -80,6 +80,12 @@ pub enum StorageError {
     /// retries.
     #[error("permanent storage error: {0}")]
     Permanent(String),
+    /// A `get` targeted a key that resolves to a directory, not a file
+    /// blob. Not a transient failure — a read aimed at the wrong kind of
+    /// path — so it is surfaced typed, letting the FS facade fold it into
+    /// a model correction rather than a retryable storage error.
+    #[error("path is a directory, not a file: {0}")]
+    IsADirectory(String),
     /// Escape hatch for errors that don't fit the taxonomy. Prefer
     /// classifying when possible.
     #[error(transparent)]
@@ -96,9 +102,15 @@ impl StorageError {
             K::NotFound => StorageError::NotFound(err.to_string()),
             K::AlreadyExists => StorageError::Conflict(err.to_string()),
             K::PermissionDenied => StorageError::Permanent(err.to_string()),
+            K::IsADirectory => StorageError::IsADirectory(err.to_string()),
             K::Interrupted | K::TimedOut | K::WouldBlock => {
                 StorageError::Transient(err.to_string())
             }
+            // EISDIR (os error 21) on toolchains/platforms that don't surface
+            // it as the typed `IsADirectory` kind: still a directory read, not
+            // a transient failure — classify it so a bad read never wedges the
+            // retry loop.
+            _ if err.raw_os_error() == Some(21) => StorageError::IsADirectory(err.to_string()),
             _ => StorageError::Other(anyhow::Error::from(err)),
         }
     }
@@ -485,6 +497,11 @@ mod tests {
 
         let to = StorageError::from_io(io::Error::new(io::ErrorKind::TimedOut, "x"));
         assert!(matches!(to, StorageError::Transient(_)));
+
+        // A directory read is a caller fault, not a transient failure — it
+        // must not land in a retryable bucket, or a bad read wedges forever.
+        let dir = StorageError::from_io(io::Error::new(io::ErrorKind::IsADirectory, "x"));
+        assert!(matches!(dir, StorageError::IsADirectory(_)));
 
         // Unknown kinds fall into Other.
         let other = StorageError::from_io(io::Error::other("x"));

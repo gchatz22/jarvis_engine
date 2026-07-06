@@ -133,6 +133,12 @@ pub enum FsError {
     /// the next step adapts to.
     #[error("file {0} not found")]
     FileNotFound(String),
+    /// [`AgentFs::read_file`] was pointed at a directory, not a file — the
+    /// model tried to `read` a path it should `list`. A model fault (not a
+    /// storage failure), so the cycle folds it into a correction that
+    /// redirects the model rather than retrying the read forever.
+    #[error("{0} is a directory, not a file — use `list` to see its entries, or `read` a specific file inside it")]
+    IsADirectory(String),
     /// [`AgentFs::write_conflict`] was called with fewer than two
     /// alternatives — a single-alternative conflict carries no
     /// information so the writer rejects it as a structural error.
@@ -862,11 +868,13 @@ impl AgentFs {
     pub async fn read_file(&self, path: &str) -> anyhow::Result<String> {
         let rel = self.clean_relpath(path)?;
         let key = self.key(&rel);
-        let got = self
-            .storage
-            .get(&key)
-            .await
-            .map_err(|e| FsError::storage(&key, e))?;
+        let got = match self.storage.get(&key).await {
+            Ok(got) => got,
+            Err(crate::storage::StorageError::IsADirectory(_)) => {
+                return Err(FsError::IsADirectory(path.to_string()).into())
+            }
+            Err(e) => return Err(FsError::storage(&key, e).into()),
+        };
         match got {
             Some(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
             None => Err(FsError::FileNotFound(path.to_string()).into()),
@@ -2014,6 +2022,21 @@ mod tests {
             got.filenames
         );
         assert!(got.filenames.iter().any(|f| f == "a.md"));
+    }
+
+    #[tokio::test]
+    async fn read_file_on_a_directory_is_a_model_fault_not_a_storage_error() {
+        let (_tmp, fs, _m) = fresh_fs().await;
+        // Writing a note materializes the `notes/` directory on disk.
+        write_note(&fs, "a.md").await;
+        let err = fs.read_file("notes").await.unwrap_err();
+        match err.downcast_ref::<FsError>() {
+            Some(FsError::IsADirectory(p)) => assert_eq!(p, "notes"),
+            other => panic!("expected FsError::IsADirectory, got {other:?}"),
+        }
+        // Must classify as a model fault so the cycle folds it into a
+        // correction instead of retrying the read forever (the doom-loop).
+        assert!(crate::agent_core::is_model_fault(&err));
     }
 
     #[tokio::test]

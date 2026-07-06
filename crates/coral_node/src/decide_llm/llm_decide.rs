@@ -138,7 +138,7 @@ impl TickTotals {
 #[async_trait]
 impl Decide for LlmDecide {
     async fn decide(&self, session: &Session) -> Result<Decision> {
-        let tools = decision_tools();
+        let tools = decision_tools(!session.seed.runtime_tools.is_empty());
         // Resolve the agent's `provider/model` to its client and a bare
         // model id. The pair rides every attempt this step, including the
         // corrective retry. An unregistered provider is an operator
@@ -408,7 +408,7 @@ mod tests {
     use super::*;
     use crate::decision::{ClaimSeed, FsIndex, Seed, ToolCall as DecisionToolCall};
     use crate::mandate::Mandate;
-    use crate::model_client::{CompleteResponse, ToolCall, Usage, Vendor};
+    use crate::model_client::{CompleteResponse, ToolCall, ToolSpec, Usage, Vendor};
     use serde_json::json;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -1002,7 +1002,13 @@ mod tests {
             good_idle_call(),
         ]))]);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
-        let _ = decide.decide(&empty_session()).await.unwrap();
+        let mut session = empty_session();
+        session.seed.runtime_tools = vec![ToolSpec {
+            name: "echo".into(),
+            description: "echo".into(),
+            input_schema: json!({"type": "object"}),
+        }];
+        let _ = decide.decide(&session).await.unwrap();
 
         let seen = mock.seen();
         let req = &seen[0];
@@ -1014,6 +1020,24 @@ mod tests {
         // Persistence is universal: the model is never offered a
         // self-terminate tool.
         assert!(!names.contains(&"retire"));
+    }
+
+    #[tokio::test]
+    async fn a_toolless_agent_is_not_offered_call_tool() {
+        let mock = MockModelClient::new(vec![MockOutcome::Resp(resp_with_tool_calls(vec![
+            good_idle_call(),
+        ]))]);
+        let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
+        let _ = decide.decide(&empty_session()).await.unwrap();
+
+        let seen = mock.seen();
+        let names: Vec<&str> = seen[0].tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"call_tool"),
+            "an agent with no runtime tools has nothing to call — do not offer `call_tool`"
+        );
+        assert!(names.contains(&"write_output"));
+        assert!(names.contains(&"idle"));
     }
 
     #[tokio::test]

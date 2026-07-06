@@ -42,8 +42,12 @@ const TOOL_NAMES: &[&str] = &[
 /// describe the field as `object` and let `parse_decision` surface a
 /// structured error if the model emits the wrong inner shape. Tighter JSON
 /// Schema would duplicate `decision.rs` and drift from it under change.
-pub fn decision_tools() -> Vec<ToolSpec> {
-    vec![
+///
+/// `has_tools` gates the generic `call_tool`: an agent granted no runtime
+/// tools is not offered it, since a `call_tool` it can only fail is one more
+/// dead-end for a weak model to burn steps on.
+pub fn decision_tools(has_tools: bool) -> Vec<ToolSpec> {
+    let mut tools = vec![
         ToolSpec {
             name: "call_tool".into(),
             description: "Express the decision to invoke a runtime tool. The runtime — \
@@ -290,7 +294,11 @@ pub fn decision_tools() -> Vec<ToolSpec> {
                 "required": ["child_ref", "new_mandate"]
             }),
         },
-    ]
+    ];
+    if !has_tools {
+        tools.retain(|t| t.name != "call_tool");
+    }
+    tools
 }
 
 /// Structured failure mode from `parse_decision`. Each variant carries
@@ -528,15 +536,28 @@ mod tests {
 
     #[test]
     fn decision_tools_has_one_entry_per_variant() {
-        let tools = decision_tools();
+        let tools = decision_tools(true);
         assert_eq!(tools.len(), TOOL_NAMES.len());
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, TOOL_NAMES);
     }
 
     #[test]
+    fn decision_tools_omits_call_tool_when_no_runtime_tools_are_granted() {
+        let tools = decision_tools(false);
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            !names.contains(&"call_tool"),
+            "a tool-less agent must not be offered `call_tool`"
+        );
+        assert!(names.contains(&"write_output"), "the rest of the set stays");
+        assert!(names.contains(&"idle"));
+        assert_eq!(names.len(), TOOL_NAMES.len() - 1);
+    }
+
+    #[test]
     fn decision_tools_have_nonempty_descriptions_and_object_schemas() {
-        for t in decision_tools() {
+        for t in decision_tools(true) {
             assert!(
                 !t.description.is_empty(),
                 "{} has empty description",
@@ -750,7 +771,7 @@ mod tests {
         // is neither advertised nor parseable; a `retire` tool call is an
         // unknown tool.
         assert!(
-            !decision_tools().iter().any(|t| t.name == "retire"),
+            !decision_tools(true).iter().any(|t| t.name == "retire"),
             "`retire` must not be advertised to the model"
         );
         assert!(!TOOL_NAMES.contains(&"retire"));
@@ -773,7 +794,7 @@ mod tests {
             "text": "",
             "idle_period": 0,
         });
-        for spec in decision_tools() {
+        for spec in decision_tools(true) {
             let minimal: Value = match spec.name.as_str() {
                 "call_tool" => json!({
                     "name": "noop",

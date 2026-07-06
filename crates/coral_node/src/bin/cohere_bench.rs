@@ -247,7 +247,7 @@ async fn main() -> std::process::ExitCode {
     let client = CohereClient::new().with_model(&args.model);
     let session = kickoff_session(&args.mandate, &args.tools);
     let messages = render(&session);
-    let mut tools = decision_tools();
+    let mut tools = decision_tools(true);
     // Restrict the offered decision-tool set, to concentrate `call_tool`
     // attempts (fewer navigation escape hatches) and to probe whether a
     // smaller surface itself changes the rejection rate.

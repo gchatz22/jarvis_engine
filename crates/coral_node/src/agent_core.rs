@@ -45,13 +45,20 @@ use crate::trigger::Trigger;
 /// decomposed. Superseded by the per-cycle token budget when that lands.
 pub const CYCLE_RUNAWAY_FUSE: usize = 50_000;
 
-/// Once the trailing run of inspection-only steps (`read`/`list`/`search`)
-/// reaches this many with no Output produced yet this cycle, the step's
-/// observation carries a nudge to act. Far below [`CYCLE_RUNAWAY_FUSE`]: this
-/// steers a weak model that keeps inspecting — often re-reading what it has
-/// already seen, or combing an empty filesystem — back toward minting the
-/// evidence an Output needs, where the fuse only stops a truly stuck one.
+/// Trailing inspection-run length that trips the wander nudge *before* an
+/// Output exists this cycle. Orientation is legitimate early, so the bar sits
+/// well above a normal orient-then-act opening and far below
+/// [`CYCLE_RUNAWAY_FUSE`]: it steers a weak model that keeps inspecting —
+/// re-reading what it has already seen, or combing an empty filesystem — back
+/// toward minting the evidence an Output needs.
 const WANDER_NUDGE_AFTER: usize = 4;
+
+/// Same, but *after* an Output exists this cycle. The arc there is
+/// write-then-idle — one step to re-check the fresh Output is about all the
+/// legitimate work there is — so a shorter run trips it, before a weak model
+/// churns indefinitely past its own Output and never idles (which, leaving
+/// the cycle unended, also leaves the Output uncommitted).
+const WANDER_NUDGE_AFTER_OUTPUT: usize = 2;
 
 /// A step that only inspects the filesystem — it advances no work and mints
 /// no evidence.
@@ -62,25 +69,43 @@ fn is_inspection(action: &Decision) -> bool {
     )
 }
 
-/// If `next` would extend an unbroken run of inspection-only steps to
-/// [`WANDER_NUDGE_AFTER`] with no Output produced yet this cycle, return a
-/// nudge for the host to append to `next`'s observation. The model reads it
-/// on its following turn and is steered off inspecting and toward producing.
+/// Return a nudge for the host to append to `next`'s observation when the
+/// cycle is wandering; the model reads it on its following turn and is steered
+/// back on track. `None` when the cycle is progressing normally.
 ///
-/// The run counts the tail of `session` (which does not yet include `next`)
-/// plus `next` itself, so any productive step in between — a tool call, a
-/// reconcile — resets it: the nudge fires only on *sustained* inspection.
-/// Returns `None` once an Output already exists this cycle, since inspection
-/// after producing is legitimate.
+/// Two regimes, because the right next move differs:
+///
+/// * **Before any Output this cycle** — only a *sustained inspection* run is
+///   wandering; producing steps (a tool call, a reconcile) are the work. The
+///   trailing inspection run (the tail of `session`, which excludes `next`,
+///   plus `next` itself) must reach [`WANDER_NUDGE_AFTER`], and the nudge
+///   points toward producing an Output.
+/// * **After the first Output this cycle** — the arc is write-then-idle, so
+///   *any* further churn is wandering, not only inspection. Counting a
+///   trailing inspection run would miss a node that interleaves reconciles
+///   with reads (each reconcile resets the run to zero and it never fires) —
+///   exactly the shape a reconciling parent falls into. So here the count is
+///   every step since the first Output, type-agnostic, tripping at
+///   [`WANDER_NUDGE_AFTER_OUTPUT`], and the nudge points toward `idle`.
 pub fn wander_nudge(session: &Session, next: &Decision) -> Option<String> {
-    if !is_inspection(next) {
-        return None;
-    }
-    if session
+    if let Some(first_write) = session
         .steps
         .iter()
-        .any(|s| matches!(s.action, Decision::WriteOutput { .. }))
+        .position(|s| matches!(s.action, Decision::WriteOutput { .. }))
     {
+        // Steps after the first Output (`session.len() - 1 - first_write`)
+        // plus `next` itself.
+        let run = session.steps.len() - first_write;
+        if run < WANDER_NUDGE_AFTER_OUTPUT {
+            return None;
+        }
+        return Some(format!(
+            "\n\n[{run} steps since you wrote your Output this cycle. You have already produced it \
+             — `idle` now to end the cycle, unless something has changed that needs a fresh \
+             Output. Stop reconciling and inspecting.]"
+        ));
+    }
+    if !is_inspection(next) {
         return None;
     }
     let run = session
@@ -938,22 +963,52 @@ mod tests {
         assert!(wander_nudge(&s, &Decision::Read { path: "d".into() }).is_none());
     }
 
+    fn wrote_output() -> (Decision, Observation) {
+        (
+            Decision::WriteOutput {
+                body: "done".into(),
+                citations: vec!["evidence/echo-1.json".into()],
+            },
+            Observation::ok("output written"),
+        )
+    }
+
     #[test]
-    fn wander_nudge_is_suppressed_once_an_output_exists_this_cycle() {
-        // Inspection after producing is legitimate — a long run must not nudge.
+    fn wander_nudge_steers_to_idle_after_an_output_is_written() {
+        // Once an Output exists this cycle the arc is write-then-idle, so a
+        // short post-write inspection run nudges toward `idle`, not producing.
+        let s = session_with(vec![wrote_output(), inspect("a")]);
+        let nudge = wander_nudge(&s, &Decision::Read { path: "b".into() })
+            .expect("a second post-write inspection must nudge");
+        assert!(nudge.contains("`idle` now"), "got: {nudge}");
+        assert!(nudge.contains("already"), "got: {nudge}");
+    }
+
+    #[test]
+    fn wander_nudge_allows_a_single_post_output_inspection() {
+        // Re-reading the fresh Output once is legitimate; the post-write fuse
+        // trips on the second, not the first.
+        let s = session_with(vec![wrote_output()]);
+        assert!(wander_nudge(&s, &Decision::Read { path: "a".into() }).is_none());
+    }
+
+    #[test]
+    fn wander_nudge_after_output_counts_every_step_not_just_inspection() {
+        // The reconciling-parent churn: after writing, it interleaves
+        // reconciles and note-writes with reads, none of which extend a
+        // trailing *inspection* run — so an inspection-only count never fires
+        // and it never idles. Post-write the count is every step, so a
+        // non-inspection `next` still trips the idle nudge.
         let s = session_with(vec![
+            wrote_output(),
             (
-                Decision::WriteOutput {
-                    body: "done".into(),
-                    citations: vec!["evidence/echo-1.json".into()],
-                },
-                Observation::ok("output written"),
+                Decision::RewriteFs { ops: vec![] },
+                Observation::ok("notes"),
             ),
-            inspect("a"),
-            inspect("b"),
-            inspect("c"),
         ]);
-        assert!(wander_nudge(&s, &Decision::Read { path: "d".into() }).is_none());
+        let nudge = wander_nudge(&s, &Decision::RewriteFs { ops: vec![] })
+            .expect("a non-inspection step after the Output must still nudge toward idle");
+        assert!(nudge.contains("`idle` now"), "got: {nudge}");
     }
 
     // ---------- `execute_step` — clean steps -----------------------------

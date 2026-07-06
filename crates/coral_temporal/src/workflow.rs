@@ -563,7 +563,10 @@ impl AgentWorkflow {
                     break;
                 }
 
-                let observation = execute_action(ctx, &input, &action).await?;
+                let mut observation = execute_action(ctx, &input, &action).await?;
+                if let Some(nudge) = coral_node::agent_core::wander_nudge(&session, &action) {
+                    observation.content.push_str(&nudge);
+                }
                 session.push(action, observation);
 
                 if session.len() >= CYCLE_RUNAWAY_FUSE {

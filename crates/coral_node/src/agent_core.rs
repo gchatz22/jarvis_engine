@@ -45,6 +45,61 @@ use crate::trigger::Trigger;
 /// decomposed. Superseded by the per-cycle token budget when that lands.
 pub const CYCLE_RUNAWAY_FUSE: usize = 50_000;
 
+/// Once the trailing run of inspection-only steps (`read`/`list`/`search`)
+/// reaches this many with no Output produced yet this cycle, the step's
+/// observation carries a nudge to act. Far below [`CYCLE_RUNAWAY_FUSE`]: this
+/// steers a weak model that keeps inspecting — often re-reading what it has
+/// already seen, or combing an empty filesystem — back toward minting the
+/// evidence an Output needs, where the fuse only stops a truly stuck one.
+const WANDER_NUDGE_AFTER: usize = 4;
+
+/// A step that only inspects the filesystem — it advances no work and mints
+/// no evidence.
+fn is_inspection(action: &Decision) -> bool {
+    matches!(
+        action,
+        Decision::Read { .. } | Decision::List { .. } | Decision::Search { .. }
+    )
+}
+
+/// If `next` would extend an unbroken run of inspection-only steps to
+/// [`WANDER_NUDGE_AFTER`] with no Output produced yet this cycle, return a
+/// nudge for the host to append to `next`'s observation. The model reads it
+/// on its following turn and is steered off inspecting and toward producing.
+///
+/// The run counts the tail of `session` (which does not yet include `next`)
+/// plus `next` itself, so any productive step in between — a tool call, a
+/// reconcile — resets it: the nudge fires only on *sustained* inspection.
+/// Returns `None` once an Output already exists this cycle, since inspection
+/// after producing is legitimate.
+pub fn wander_nudge(session: &Session, next: &Decision) -> Option<String> {
+    if !is_inspection(next) {
+        return None;
+    }
+    if session
+        .steps
+        .iter()
+        .any(|s| matches!(s.action, Decision::WriteOutput { .. }))
+    {
+        return None;
+    }
+    let run = session
+        .steps
+        .iter()
+        .rev()
+        .take_while(|s| is_inspection(&s.action))
+        .count()
+        + 1;
+    if run < WANDER_NUDGE_AFTER {
+        return None;
+    }
+    Some(format!(
+        "\n\n[{run} inspection steps this cycle and nothing produced yet. Stop inspecting — \
+         an empty or already-seen file is not work to investigate. Take a productive step now: \
+         mint evidence with a tool call (or reconcile a child report), then `write_output`.]"
+    ))
+}
+
 /// Filenames surfaced per bucket (`notes/`, `outputs/`) in the cycle seed's
 /// index — a **recency window**, not the whole directory. Pointers only: the
 /// model reads bodies via `Read` and `list`s/`search`es for anything past the
@@ -820,6 +875,85 @@ mod tests {
     #[test]
     fn status_note_path_matches_the_pinned_filename() {
         assert_eq!(STATUS_NOTE_PATH, format!("notes/{STATUS_NOTE}"));
+    }
+
+    // ---------- `wander_nudge` -------------------------------------------
+
+    fn inspect(path: &str) -> (Decision, Observation) {
+        (
+            Decision::Read { path: path.into() },
+            Observation::ok("body"),
+        )
+    }
+
+    fn tool_call() -> (Decision, Observation) {
+        (
+            Decision::CallTools {
+                calls: vec![ToolCall::new(
+                    "echo",
+                    json!({"msg": "x"}),
+                    ClaimSeed::new("s"),
+                )],
+            },
+            Observation::ok("evidence/echo-1.json"),
+        )
+    }
+
+    #[test]
+    fn wander_nudge_fires_once_the_inspection_run_reaches_the_threshold() {
+        // Three prior inspections; the fourth (`next`) completes the run.
+        let s = session_with(vec![
+            inspect("notes/a.md"),
+            inspect("notes/b.md"),
+            inspect("c"),
+        ]);
+        let nudge = wander_nudge(
+            &s,
+            &Decision::List {
+                path: "notes/".into(),
+            },
+        )
+        .expect("a fourth inspection step must nudge");
+        assert!(nudge.contains("4 inspection steps"), "got: {nudge}");
+        assert!(nudge.contains("Stop inspecting"), "got: {nudge}");
+    }
+
+    #[test]
+    fn wander_nudge_is_silent_below_the_threshold() {
+        let s = session_with(vec![inspect("notes/a.md"), inspect("notes/b.md")]);
+        assert!(wander_nudge(&s, &Decision::Read { path: "c".into() }).is_none());
+    }
+
+    #[test]
+    fn wander_nudge_does_not_fire_on_a_productive_step() {
+        let s = session_with(vec![inspect("a"), inspect("b"), inspect("c")]);
+        assert!(wander_nudge(&s, &tool_call().0).is_none());
+    }
+
+    #[test]
+    fn a_productive_step_resets_the_inspection_run() {
+        // A tool call mid-run breaks the trailing count: only the one
+        // inspection after it is trailing, so `next` makes a run of two.
+        let s = session_with(vec![inspect("a"), inspect("b"), tool_call(), inspect("c")]);
+        assert!(wander_nudge(&s, &Decision::Read { path: "d".into() }).is_none());
+    }
+
+    #[test]
+    fn wander_nudge_is_suppressed_once_an_output_exists_this_cycle() {
+        // Inspection after producing is legitimate — a long run must not nudge.
+        let s = session_with(vec![
+            (
+                Decision::WriteOutput {
+                    body: "done".into(),
+                    citations: vec!["evidence/echo-1.json".into()],
+                },
+                Observation::ok("output written"),
+            ),
+            inspect("a"),
+            inspect("b"),
+            inspect("c"),
+        ]);
+        assert!(wander_nudge(&s, &Decision::Read { path: "d".into() }).is_none());
     }
 
     // ---------- `execute_step` — clean steps -----------------------------

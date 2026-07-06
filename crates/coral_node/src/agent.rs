@@ -265,13 +265,16 @@ impl<D: Decide> Agent<D> {
                     // Repertoire step: run it, account any recoverable failure
                     // against the per-cycle budget, and append the observation
                     // (success *or* failure) so the model adapts next step.
-                    let outcome = agent_core::execute_step(&fs, &tools, &action).await?;
+                    let mut outcome = agent_core::execute_step(&fs, &tools, &action).await?;
                     let maybe_incident = match &outcome.failure {
                         None => None,
                         Some(failure) => {
                             record_cycle_failure(&mut health, &mut retry_trail, failure)?
                         }
                     };
+                    if let Some(nudge) = agent_core::wander_nudge(&session, &action) {
+                        outcome.observation.content.push_str(&nudge);
+                    }
                     session.push(action, outcome.observation);
                     if let Some(incident) = maybe_incident {
                         warn!("per-cycle retry budget exhausted; transitioning to Unhealthy");

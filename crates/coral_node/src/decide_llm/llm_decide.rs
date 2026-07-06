@@ -28,8 +28,11 @@ use crate::model_client::{
 
 /// Number of corrective re-asks performed after the first attempt fails to
 /// parse. Total upstream calls per `decide` is therefore at most
-/// `1 + MAX_DECISION_RETRIES`.
-pub const MAX_DECISION_RETRIES: usize = 1;
+/// `1 + MAX_DECISION_RETRIES`. Forcing a tool call (see the Cohere adapter)
+/// is what actually removes the common empty-decide; this depth only cushions
+/// the residual — a schema-invalid resample from a flaky model — and is paid
+/// solely on the failure path, so a couple extra re-asks buys robustness cheaply.
+pub const MAX_DECISION_RETRIES: usize = 3;
 
 /// `Decide` impl that asks a model what to do next.
 ///
@@ -367,8 +370,9 @@ fn synthesized_tool_results(ids: &[String]) -> Message {
 /// tests can reference the same source of truth as the renderer.
 fn corrective_system_text(err: &DecisionParseError) -> String {
     format!(
-        "Your previous tool-use response could not be parsed into a Decision: {err}. \
-         Reply by calling exactly one decision tool \
+        "Your previous response could not be parsed into a Decision: {err}. \
+         Every turn you MUST answer by calling a tool — never with plain prose, an \
+         explanation, or an empty message. Reply now with exactly one decision tool \
          (`read`, `list`, `search`, `write_output`, `rewrite_fs`, `idle`) \
          OR one or more `call_tool` blocks dispatched together as a single \
          parallel batch, with schema-correct arguments. Do not mix `call_tool` \
@@ -780,16 +784,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parse_failure_on_both_attempts_returns_err() {
-        let mock = MockModelClient::new(vec![
-            MockOutcome::Resp(resp_with_tool_calls(vec![malformed_unknown_tool()])),
-            // 2nd attempt: still bad — different malformed payload.
-            MockOutcome::Resp(resp_with_tool_calls(vec![ToolCall {
-                id: "toolu_bad2".into(),
-                name: "retire".into(),
-                arguments: json!({}), // missing required `reason` field
-            }])),
-        ]);
+    async fn parse_failure_on_every_attempt_returns_err() {
+        let total_attempts = MAX_DECISION_RETRIES + 1;
+        let script: Vec<MockOutcome> = (0..total_attempts)
+            .map(|_| MockOutcome::Resp(resp_with_tool_calls(vec![malformed_unknown_tool()])))
+            .collect();
+        let mock = MockModelClient::new(script);
         let decide = LlmDecide::new(mock.clone(), CompleteOptions::default());
 
         let err = decide.decide(&empty_session()).await.unwrap_err();
@@ -797,7 +797,6 @@ mod tests {
         // The message must enumerate every attempt so an operator reading
         // a log can see how the model failed at each step. We pin the
         // exact attempt count so the loop refactor stays honest.
-        let total_attempts = MAX_DECISION_RETRIES + 1;
         assert!(
             s.contains(&format!("all {total_attempts} attempt")),
             "error should report total attempt count, got: {s}"
@@ -1170,29 +1169,22 @@ mod tests {
     async fn tick_totals_capture_stats_even_when_all_attempts_fail_to_parse() {
         // When parsing fails on every attempt the call still happened on
         // the wire; the operator log must see the cost even though decide
-        // returns Err. Both attempts contribute to the totals.
-        let s1 = anthropic_stats(20, 3, 80);
-        let s2 = anthropic_stats(40, 4, 90);
-        let mock = MockModelClient::new(vec![
-            MockOutcome::Resp(resp_with_stats(vec![malformed_unknown_tool()], s1.clone())),
-            MockOutcome::Resp(resp_with_stats(
-                vec![ToolCall {
-                    id: "toolu_bad2".into(),
-                    name: "retire".into(),
-                    arguments: json!({}),
-                }],
-                s2.clone(),
-            )),
-        ]);
+        // returns Err. Every attempt contributes to the totals.
+        let attempts = (MAX_DECISION_RETRIES + 1) as u32;
+        let s = anthropic_stats(20, 3, 80);
+        let script: Vec<MockOutcome> = (0..attempts)
+            .map(|_| MockOutcome::Resp(resp_with_stats(vec![malformed_unknown_tool()], s.clone())))
+            .collect();
+        let mock = MockModelClient::new(script);
         let decide = LlmDecide::new(mock, CompleteOptions::default());
         let err = decide.decide(&empty_session()).await.unwrap_err();
         assert!(err.to_string().contains("no valid decision"));
 
         let totals = decide.last_tick_totals();
-        assert_eq!(totals.calls, 2);
-        assert_eq!(totals.input_tokens, 60);
-        assert_eq!(totals.output_tokens, 7);
-        assert_eq!(totals.latency_ms, 170);
+        assert_eq!(totals.calls, attempts);
+        assert_eq!(totals.input_tokens, 20 * attempts);
+        assert_eq!(totals.output_tokens, 3 * attempts);
+        assert_eq!(totals.latency_ms, 80 * u64::from(attempts));
     }
 
     #[tokio::test]

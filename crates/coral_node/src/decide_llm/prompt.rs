@@ -102,9 +102,15 @@ fn render_tool_catalog(tools: &[String], specs: &[ToolSpec]) -> String {
 }
 
 /// A wake carrying only `ScheduledWake` is a refresh, not a reaction; this is
-/// the whole briefing for that case.
-const SCHEDULED_REFRESH: &str =
-    "# Wake — scheduled refresh, no new signals. Re-check your slice and refresh your Output.";
+/// the whole briefing for that case. It names all three branches the model
+/// must choose between — the no-Output branch makes `idle` the affirmative
+/// instruction so an agent woken with nothing to act on waits for a real
+/// signal instead of manufacturing work, while the stale branch keeps the
+/// refresh teeth for a continuous agent whose world has moved on.
+const SCHEDULED_REFRESH: &str = "# Wake — scheduled refresh; no new signals. \
+     If you have no Output yet and nothing to act on, `idle` now and wait for a real signal \
+     rather than manufacturing work. If your Output is already current, `idle`. Otherwise \
+     refresh it to reflect what changed, then `idle`.";
 
 /// Render the wake briefing: a readable, grouped overview of what woke the
 /// agent, derived entirely from the drained trigger batch.
@@ -599,6 +605,23 @@ mod tests {
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[1].role, Role::User);
         assert_eq!(text(&msgs[1]), SCHEDULED_REFRESH);
+    }
+
+    #[test]
+    fn scheduled_refresh_names_both_the_idle_and_the_refresh_branch() {
+        // An agent woken with nothing to act on must be told to idle
+        // affirmatively (the empty-first-wake case), and a continuous agent
+        // whose world moved on must still be told to refresh — this graph is
+        // all-`never`, so the refresh branch has no live coverage and this is
+        // its only guard against a silent regression.
+        assert!(
+            SCHEDULED_REFRESH.contains("`idle` now and wait for a real signal"),
+            "the no-Output branch must make idle the affirmative instruction, got: {SCHEDULED_REFRESH}"
+        );
+        assert!(
+            SCHEDULED_REFRESH.contains("refresh it to reflect what changed"),
+            "the stale branch must keep the refresh teeth, got: {SCHEDULED_REFRESH}"
+        );
     }
 
     #[test]

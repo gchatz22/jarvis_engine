@@ -27,6 +27,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use coral_graph::GraphStore;
 use coral_node::storage::{PerAgentGitStorage, VersionedStorage};
+use coral_worker::reaper::{run_reaper, ReaperConfig};
 use coral_worker::tool_provider::DbToolRegistryProvider;
 use sqlx::postgres::PgPoolOptions;
 use temporalio_client::{Client, ClientOptions, Connection, ConnectionOptions};
@@ -122,7 +123,9 @@ async fn main() -> Result<()> {
 
     // Per-graph tool registries are built lazily from each graph's structural
     // rows (builtin echo plus that graph's MCP servers), so `graph.yaml` is
-    // the runtime source of truth for tools.
+    // the runtime source of truth for tools. Clone the store first so the
+    // quiescence-GC reaper keeps a handle after the provider takes ownership.
+    let reaper_store = graph_store.clone();
     install_tool_registry_provider(Arc::new(DbToolRegistryProvider::new(graph_store)));
     info!(
         "installed ToolRegistryProvider (per-graph registries from structural DB; builtin: echo)"
@@ -137,8 +140,20 @@ async fn main() -> Result<()> {
     )?;
 
     let client = build_client().await?;
-    let mut worker = build_worker(&runtime, client, &task_queue)?;
+    let mut worker = build_worker(&runtime, client.clone(), &task_queue)?;
     let shutdown = worker.shutdown_handle();
+
+    // Quiescence-GC reaper: a background sweep that retires provably-dead graphs
+    // (all agents `never`-cadence, parked, and stable-idle across a full
+    // propagation wave). Being a live worker itself, it satisfies the
+    // "a live worker must be observing the graph" guard.
+    let reaper_config = ReaperConfig::from_env();
+    tokio::spawn(run_reaper(client, reaper_store, reaper_config));
+    info!(
+        interval_secs = reaper_config.interval.as_secs(),
+        wave_margin_secs = reaper_config.wave_margin.as_secs(),
+        "spawned quiescence-GC reaper"
+    );
 
     // SIGINT handler runs on a spawned task because `Worker` is not `Send`
     // and must stay pinned to the main task.

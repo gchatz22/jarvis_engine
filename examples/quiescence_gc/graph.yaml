@@ -1,0 +1,54 @@
+# Quiescence-GC fixture: a `never`-cadence star graph (one parent + two
+# children) that converges to a fixpoint and then must be garbage-collected.
+#
+# Every node is `never`, the child seeds are one-shot, and the parent is not
+# seeded (its forced first tick is a bare ScheduledWake it idles from, then it
+# wakes only on ChildOutput). Once both children emit and the parent folds them,
+# no signal can originate: the graph is quiescent, and its workflows would
+# otherwise stay alive forever. The GC reaper detects that fixpoint and retires
+# all three.
+#
+# Deterministic contract test only: `quiescence_gc_live.rs` installs a scripted
+# `Decide` and plants the evidence the children cite, so this needs only
+# Temporal + Postgres (no Node, no model key). The `echo` builtin is granted but
+# never dispatched on that path.
+apiVersion: coral.engine/v1alpha1
+kind: Graph
+metadata:
+  name: quiescence-gc
+  description: |
+    A never-cadence star graph that reaches a fixpoint (all agents parked,
+    no signal source) so the quiescence-GC reaper can retire it.
+defaults:
+  idle_period: never
+tools:
+  - id: echo
+    kind: builtin
+    builtin: echo
+agents:
+  - id: analyst
+    mandate:
+      text: |
+        You coordinate two researchers. As each child reports an output,
+        reconcile that output and emit a consolidated summary that cites the
+        child outputs you folded in.
+    tools: [echo]
+    children:
+      - id: researcher-alpha
+        mandate:
+          text: |
+            Research topic alpha; emit one finding that cites your evidence.
+        tools: [echo]
+      - id: researcher-beta
+        mandate:
+          text: |
+            Research topic beta; emit one finding that cites your evidence.
+        tools: [echo]
+seed:
+  triggers:
+    - agent: researcher-alpha
+      at: start
+      external: { kind: kickoff, payload: {} }
+    - agent: researcher-beta
+      at: start
+      external: { kind: kickoff, payload: {} }

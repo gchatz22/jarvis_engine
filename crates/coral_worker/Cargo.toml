@@ -47,6 +47,10 @@ sqlx = { version = "=0.8.6", default-features = false, features = [
     "postgres",
 ] }
 
+# The quiescence-GC reaper enumerates graph/agent ids (both `Uuid`) to build
+# workflow ids and query the structural DB.
+uuid = { version = "1", default-features = false }
+
 [features]
 # Pass-through to `coral_temporal`'s vendor features so the daemon can be built
 # against one or both LLM vendors. `build_decide_from_env` is `#[cfg]`-gated on

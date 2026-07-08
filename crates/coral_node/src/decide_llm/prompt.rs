@@ -20,8 +20,9 @@
 use crate::agent_ref::AgentRef;
 use crate::decision::{Decision, FsIndex, ReconcileSource, Remainder, Seed, Session, Step};
 use crate::mandate::{Mandate, OutputId};
-use crate::model_client::{Message, ToolSpec};
+use crate::model_client::{ContentBlock, Message, Role, ToolSpec};
 use crate::trigger::{HumanOp, Trigger};
+use serde_json::{json, Value};
 
 /// The standing system prompt — agent identity, operating principles, and the
 /// hard rules — authored as markdown in `system_prompt.md`. `{{MANDATE}}` and
@@ -41,15 +42,32 @@ pub fn render(session: &Session) -> Vec<Message> {
         index,
         runtime_tools,
     } = &session.seed;
-    // At most 4: system + triggers + index + steps.
-    let mut out = Vec::with_capacity(4);
+    let mut out = Vec::with_capacity(2 + session.steps.len() * 2);
     out.push(Message::system(render_system(mandate, runtime_tools)));
+
+    // The opening user turn frames the work: what woke the agent and a
+    // pointer index of its files. The steps it has already taken this cycle
+    // then follow as native assistant/tool turns — its tool calls in its own
+    // voice, each answered by a tool result — so the model reasons over its
+    // own history the way it was trained to, not from a third-person recap.
+    let mut framing = String::new();
     if !triggers.is_empty() {
-        out.push(Message::user(render_triggers(triggers)));
+        framing.push_str(&render_triggers(triggers));
+        framing.push_str("\n\n");
     }
-    out.push(Message::user(render_index(index)));
-    if !session.steps.is_empty() {
-        out.push(Message::user(render_steps(&session.steps)));
+    framing.push_str(&render_index(index));
+    out.push(Message::user(framing));
+
+    for (i, step) in session.steps.iter().enumerate() {
+        let (calls, results) = step_turn(i, step);
+        out.push(Message {
+            role: Role::Assistant,
+            content: calls,
+        });
+        out.push(Message {
+            role: Role::Tool,
+            content: results,
+        });
     }
     out
 }
@@ -205,7 +223,12 @@ fn render_single_signal(t: &Trigger) -> String {
             output_id,
         } => format!(
             "# Wake — child report: {agent_name} emitted an output. \
-             Reconcile it — `reconcile_children` source: {}",
+             Reconcile it — `reconcile_children` source: {}. Once reconciled, \
+             `write_output` folding in what you now have, then `idle`. Any other child's \
+             brief arrives later as its own wake signal — it is not a file on your disk, so \
+             do not `read`/`list`/`search` for it. Fold each child as it reports; a \
+             single-sided Output now is correct and you will refresh it when the next \
+             report wakes you.",
             reconcile_source_json(child_ref, output_id)
         ),
         Trigger::ChildRetired {
@@ -268,7 +291,7 @@ fn render_index(index: &FsIndex) -> String {
          notes/: {notes}\n\
          outputs/: {outputs}\n\
          \n\
-         This index lists only your most recent files by name, not their contents, and not necessarily all of them. Use `read` to fetch a file, `list` a directory to see everything in it, or `search` to find a string across files. When something you need isn't listed here, explore for it — it has not been deleted, just not surfaced."
+         This index lists only your most recent files by name, not their contents, and not necessarily all of them. `read`, `list`, and `search` are available when a step genuinely needs a file's contents — but read only what the step you are taking now requires. An empty or unfamiliar index is not a task to investigate; it means there is nothing to orient from, so go straight to producing."
     )
 }
 
@@ -287,46 +310,86 @@ fn render_index_bucket(files: &[String], more: Remainder, dir: &str) -> String {
     }
 }
 
-/// Render the steps taken so far this cycle as a numbered history of
-/// `(action, observation)` pairs, so the model reasons over what it has
-/// already done and seen rather than repeating work.
-fn render_steps(steps: &[Step]) -> String {
-    let mut s = format!("# Steps so far this cycle ({})", steps.len());
-    for (i, step) in steps.iter().enumerate() {
-        s.push_str(&format!(
-            "\n\n{}. {}\n   -> ",
-            i + 1,
-            action_label(&step.action)
-        ));
-        if !step.observation.ok {
-            s.push_str("FAILED: ");
-        }
-        s.push_str(&step.observation.content);
+/// The observation as the tool's reply content, preserving the old narrative's
+/// `FAILED:` marker on a recoverable failure so the model still tells a failed
+/// step from a clean one.
+fn observation_content(step: &Step) -> String {
+    if step.observation.ok {
+        step.observation.content.clone()
+    } else {
+        format!("FAILED: {}", step.observation.content)
     }
-    s
 }
 
-/// One-line label for a repertoire action, used in the step history. Compact
-/// and deterministic — the observation carries the detail.
-fn action_label(action: &Decision) -> String {
-    match action {
+/// Render one prior step as the native pair a tool-using model expects: the
+/// assistant's tool call(s), then the tool result(s) answering them. Every
+/// decision the model makes was itself emitted as a tool call, so each maps
+/// back to a `ToolUse`; a `CallTools` batch expands to one `ToolUse`/
+/// `ToolResult` pair per parallel call. Ids need only correlate within this
+/// one message list, so a deterministic per-step id keeps the render
+/// replay-stable across a Temporal re-execution.
+fn step_turn(i: usize, step: &Step) -> (Vec<ContentBlock>, Vec<ContentBlock>) {
+    match &step.action {
         Decision::CallTools { calls } => {
-            let names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
-            format!("call_tool: {}", names.join(", "))
+            let mut uses = Vec::with_capacity(calls.len());
+            let mut results = Vec::with_capacity(calls.len());
+            for (j, call) in calls.iter().enumerate() {
+                let id = format!("step-{i}-{j}");
+                uses.push(ContentBlock::ToolUse {
+                    id: id.clone(),
+                    name: "call_tool".to_string(),
+                    input: json!({
+                        "name": call.name,
+                        "args": call.args,
+                        "claim_seed": call.claim_seed.0,
+                    }),
+                });
+                // The step carries one aggregate observation for the whole
+                // batch; put it on the first result and mark the rest as
+                // correlated so every call still gets its required paired
+                // result (vendors reject an unanswered tool call).
+                let content = if j == 0 {
+                    observation_content(step)
+                } else {
+                    "(result reported with the first call in this batch)".to_string()
+                };
+                results.push(ContentBlock::ToolResult {
+                    tool_use_id: id,
+                    content,
+                });
+            }
+            (uses, results)
         }
-        Decision::WriteOutput { .. } => "write_output".to_string(),
-        Decision::RewriteFs { .. } => "rewrite_fs".to_string(),
-        Decision::Read { path } => format!("read {path}"),
-        Decision::List { path } => format!("list {path}"),
-        Decision::Search { query, path } => match path {
-            Some(p) => format!("search {query:?} in {p}"),
-            None => format!("search {query:?}"),
-        },
-        Decision::Idle { .. } => "idle".to_string(),
-        Decision::SpawnChild { agent_name, .. } => format!("spawn_child {agent_name}"),
-        Decision::ReconcileChildren { .. } => "reconcile_children".to_string(),
-        Decision::RetireChild { .. } => "retire_child".to_string(),
-        Decision::ReplaceChild { .. } => "replace_child".to_string(),
+        action => {
+            let id = format!("step-{i}");
+            let use_block = decision_to_tool_use(action, id.clone());
+            let result = ContentBlock::ToolResult {
+                tool_use_id: id,
+                content: observation_content(step),
+            };
+            (vec![use_block], vec![result])
+        }
+    }
+}
+
+/// Map a non-`CallTools` `Decision` back to the tool call the model emitted.
+/// `Decision`'s `#[serde(tag = "type")]` makes the tag the tool name and the
+/// remaining fields the tool input, so this is the exact inverse of
+/// `parse_decision`'s terminal-tool path and cannot drift from the schema.
+fn decision_to_tool_use(action: &Decision, id: String) -> ContentBlock {
+    let mut value = serde_json::to_value(action).unwrap_or_else(|_| json!({}));
+    let name = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("type");
+    }
+    ContentBlock::ToolUse {
+        id,
+        name,
+        input: value,
     }
 }
 

@@ -24,9 +24,12 @@
 
 use std::time::Duration;
 
+use std::str::FromStr;
+
+use coral_node::agent_ref::{AgentId, AgentRef};
 use coral_node::decide_llm::{decision_tools, parse_decision, render};
-use coral_node::decision::{Decision, FsIndex, Seed, Session};
-use coral_node::mandate::Mandate;
+use coral_node::decision::{Decision, FsIndex, Observation, ReconcileSource, Seed, Session};
+use coral_node::mandate::{Mandate, OutputId};
 use coral_node::model_client::cohere::CohereClient;
 use coral_node::model_client::{
     CompleteOptions, CompleteRequest, ContentBlock, ModelClient, ToolSpec,
@@ -48,6 +51,7 @@ struct Args {
     temperature: Option<f32>,
     max_tokens: u32,
     mandate: String,
+    scenario: String,
     tools: Vec<String>,
     only_tools: Vec<String>,
     call_tool_variant: String,
@@ -62,6 +66,7 @@ fn parse_args() -> Result<Args, String> {
     let mut temperature = None;
     let mut max_tokens = 1024u32;
     let mut mandate = DEFAULT_MANDATE.to_string();
+    let mut scenario = "kickoff".to_string();
     let mut tools = Vec::new();
     let mut only_tools = Vec::new();
     let mut call_tool_variant = "baseline".to_string();
@@ -87,6 +92,7 @@ fn parse_args() -> Result<Args, String> {
                 mandate = std::fs::read_to_string(&path)
                     .map_err(|e| format!("reading {path}: {e}"))?;
             }
+            "--scenario" => scenario = val()?,
             "--tools" => {
                 tools = val()?
                     .split(',')
@@ -105,7 +111,7 @@ fn parse_args() -> Result<Args, String> {
             "--flat" => flat = true,
             "--flatten" => flatten = true,
             "--verbose" | "-v" => verbose = true,
-            "--help" | "-h" => return Err("usage: cohere-bench [--model ID] [--trials N] [--temperature F] [--max-tokens N] [--mandate-file PATH] [--tools a,b,c] [--only-tools a,b,c] [--call-tool-variant baseline|typed-args|no-claim-seed|lean] [--verbose]".to_string()),
+            "--help" | "-h" => return Err("usage: cohere-bench [--model ID] [--trials N] [--temperature F] [--max-tokens N] [--mandate-file PATH] [--scenario kickoff|reconciled-parent] [--tools a,b,c] [--only-tools a,b,c] [--call-tool-variant baseline|typed-args|no-claim-seed|lean] [--verbose]".to_string()),
             other => return Err(format!("unknown flag: {other}")),
         }
     }
@@ -115,6 +121,7 @@ fn parse_args() -> Result<Args, String> {
         temperature,
         max_tokens,
         mandate,
+        scenario,
         tools,
         only_tools,
         call_tool_variant,
@@ -199,6 +206,64 @@ fn kickoff_session(mandate_text: &str, tools: &[String]) -> Session {
     Session::new(Seed::new(mandate, vec![kickoff], FsIndex::default()))
 }
 
+/// The synthesist parent's mandate: a two-sided judgment that folds each of
+/// two named children's briefs as they arrive. Names both children so the
+/// reconciled-parent scenario reproduces the exact confusion the live parent
+/// hit — one child folded, the *other* not yet reported.
+const SYNTHESIST_MANDATE: &str = "\
+You own a two-sided technical decision: Rust vs Go for a high-throughput API \
+backend. Two researchers report to you, each arguing one side: `rust-advocate` \
+(the case for Rust) and `go-advocate` (the case for Go). They already exist and \
+send you their briefs on their own; your role is to weigh what arrives. As each \
+brief comes in, fold it into a single recommendation that commits to a clear \
+default choice and names the condition under which the other language wins.";
+
+/// Build the prompt a parent sees at the decision point where the live wander
+/// began: it has just folded ONE of its two children (`go-advocate`) via a
+/// `ReconcileChildren` step, and the observation names the citable synthetic
+/// evidence record. The *other* child (`rust-advocate`) has not reported yet —
+/// its brief arrives later as a `ChildOutput` signal, not as a file on disk.
+///
+/// The convergent move here is to `write_output` (an honest single-sided view
+/// citing the folded brief) and `idle`, or to `idle` and wait for the sibling.
+/// The live model instead looped `list evidence` / `search rust-advocate`,
+/// hunting its own filesystem for a brief that isn't there. This scenario makes
+/// that fork measurable over N trials.
+fn reconciled_parent_session() -> Session {
+    let mut mandate = Mandate::new(SYNTHESIST_MANDATE, Duration::from_secs(60), None);
+    mandate.tools = Vec::new();
+    let child_ref = AgentRef::new(
+        "graphs/demo/agents/0c37c003-90b5-464a-8aa6-856a4562fd8d",
+        AgentId::from_str("0c37c003-90b5-464a-8aa6-856a4562fd8d").expect("valid child uuid"),
+    );
+    let output_id = OutputId::from_hex("ab".repeat(32));
+    let wake = Trigger::ChildOutput {
+        child_ref: child_ref.clone(),
+        agent_name: "go-advocate".to_string(),
+        output_id: output_id.clone(),
+    };
+    let mut session = Session::new(Seed::new(mandate, vec![wake], FsIndex::default()));
+    session.push(
+        Decision::ReconcileChildren {
+            sources: vec![ReconcileSource {
+                child_ref,
+                output_id,
+            }],
+            conflict: None,
+        },
+        Observation::ok(
+            "Reconciled go-advocate's output into \
+             evidence/reconcile-go-advocate-8000b19a.json. go-advocate argued: Go is the \
+             optimal foundation for high-throughput API backends — developer velocity (small \
+             language, fast compiles), concurrency built into the language (goroutines and \
+             channels), and a battle-tested net/http stack; the honest cost is GC latency \
+             tails under heavy load. To emit an Output, cite \
+             evidence/reconcile-go-advocate-8000b19a.json in write_output.",
+        ),
+    );
+    session
+}
+
 fn content_summary(content: &[ContentBlock]) -> String {
     if content.is_empty() {
         return "<empty>".to_string();
@@ -245,9 +310,17 @@ async fn main() -> std::process::ExitCode {
     }
 
     let client = CohereClient::new().with_model(&args.model);
-    let session = kickoff_session(&args.mandate, &args.tools);
+    let is_parent = args.scenario == "reconciled-parent";
+    let session = if is_parent {
+        reconciled_parent_session()
+    } else {
+        kickoff_session(&args.mandate, &args.tools)
+    };
     let messages = render(&session);
-    let mut tools = decision_tools(true);
+    // The parent scenario grants no runtime tools, so `call_tool` is not
+    // offered (matches the live parent); the kickoff scenario keeps the full
+    // decision surface.
+    let mut tools = decision_tools(!is_parent);
     // Restrict the offered decision-tool set, to concentrate `call_tool`
     // attempts (fewer navigation escape hatches) and to probe whether a
     // smaller surface itself changes the rejection rate.
@@ -295,8 +368,8 @@ async fn main() -> std::process::ExitCode {
     };
 
     println!(
-        "model={} trials={} max_tokens={} temperature={:?} flatten={}",
-        args.model, args.trials, args.max_tokens, args.temperature, args.flatten
+        "model={} scenario={} trials={} max_tokens={} temperature={:?} flatten={}",
+        args.model, args.scenario, args.trials, args.max_tokens, args.temperature, args.flatten
     );
     let granted = if args.tools.is_empty() {
         "(none)".to_string()
@@ -373,6 +446,24 @@ async fn main() -> std::process::ExitCode {
             .collect::<Vec<_>>()
             .join(", ");
         println!("chosen decisions: {breakdown}");
+    }
+    // For a parent that has already folded a child, the convergent moves are
+    // `write_output` (an honest single-sided view) and `idle`; the wander is
+    // re-inspecting the filesystem for a sibling brief that isn't there yet.
+    // Report the split so a prompt/tool variant's effect is a single number.
+    if is_parent {
+        let converged: u32 = ["write_output", "idle"]
+            .iter()
+            .filter_map(|k| kinds.get(k))
+            .sum();
+        let wander: u32 = ["read", "list", "search"]
+            .iter()
+            .filter_map(|k| kinds.get(k))
+            .sum();
+        println!(
+            "parent decision split: converged(write_output+idle)={converged}  \
+             wander(read+list+search)={wander}  of {valid} valid"
+        );
     }
     std::process::ExitCode::SUCCESS
 }

@@ -99,3 +99,53 @@ filename becomes less human-readable — accepted tradeoff.
 
 - **Wandering** (parent + Rust child never attempted call_tool) — prompt/behavioral.
 - **Loop completion** unproven until the live re-run.
+
+## Run 15 results (fresh worker, all fixes in) — 2026-07-08
+
+Graph `rust-vs-go-minimal-15` (`a1c1a0ef`), freshly-built worker `--features
+llm-cohere`, all anti-wander commits present.
+
+**Flatten goal: MET.** north-mini-code emits valid strict_tools decisions
+throughout — zero 422s, `CallTools` collapse works, evidence minting works,
+`write_output`+citations works, `reconcile_children` works, ChildOutput
+propagation wakes the parent. The 422/wedge era is over.
+
+**Children: complete end-to-end.** Both idled cleanly with correctly-sided,
+substantive briefs (rust-advocate: 3 evidence, ~20 steps; go-advocate: 3
+evidence, ~21 steps). Mild wander (~2× the ideal ~10 steps) but self-terminating
+— no kill needed. The parent also correctly idled its forced empty first tick in
+one step.
+
+**Parent: does NOT converge — the sole remaining blocker.** Tick 1 trace:
+`ReconcileChildren{sources:1}` (folded go-advocate), then steps 1–39 are pure
+wander — **29× `List evidence`**, 7× `Read` (incl. `read decisions/1-16.jsonl`,
+its own audit log), 3× `Search "rust-advocate"` — **no `write_output`, no
+`idle`**, unbounded until SIGKILL at step 40. It reconciled one child then hunted
+its own FS for the second brief instead of writing what it had and idling.
+
+**Root cause.** Anti-wander is *entirely prose* (system_prompt.md rules +
+`SCHEDULED_REFRESH` idle-branch + tool-catalog note). There is **no programmatic
+circuit-breaker**. The weak model reads the prose — including the explicit "do
+not re-list a directory … or read your own `decisions/` log" — and ignores it.
+Secondary: the parent doesn't model that the 2nd brief arrives as a *future
+ChildOutput signal*, not a file it can find now, so it searches its own evidence
+dir for it.
+
+**Note on convergence design (not a bug):** one-brief-per-wake is correct
+(Refresh-don't-stop). If the parent idled after each reconcile+write it would
+wake on the 2nd ChildOutput (tick 2), fold it, write the two-sided synthesis, and
+idle → quiescent → GC. The wander is what breaks that chain; nothing structural
+does.
+
+**Fix directions (for maintainer to pick — NOT yet implemented):**
+1. ⭐ **Programmatic wander circuit-breaker** (runtime, deterministic): count
+   consecutive non-productive steps (`read`/`list`/`search`) in a tick; at a
+   threshold inject a hard corrective ("you've inspected N× without producing;
+   `write_output` or `idle` now"); at a higher threshold force-idle. Doesn't
+   depend on the model obeying prose. Highest leverage.
+2. **Correction-on-repeat-inspect**: when the model re-lists/re-reads something
+   it already saw this cycle, return a correction result instead of the listing
+   (extends 081c878's single-case fold to the general repeat case).
+3. **Targeted wake-briefing**: tell a parent woken by one ChildOutput that the
+   other children's briefs arrive as future signals and cannot be found by
+   searching — write from what's folded and idle.

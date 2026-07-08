@@ -657,6 +657,15 @@ impl GraphStore {
         Ok(row)
     }
 
+    /// The id of every graph, ordered by `created_at` ASC for a stable sweep
+    /// order. Used by the quiescence-GC reaper to enumerate graphs to check.
+    pub async fn list_graphs(&self) -> sqlx::Result<Vec<Uuid>> {
+        let ids = sqlx::query_scalar!(r#"SELECT id FROM graphs ORDER BY created_at ASC"#)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(ids)
+    }
+
     /// All agents in a graph, ordered by `created_at` ASC so the result
     /// is stable across calls. Empty `Vec` if the graph has no agents
     /// (or doesn't exist — we don't distinguish; the structural DB
@@ -1003,6 +1012,23 @@ mod tests {
         let store = GraphStore::new(pool);
         let agents = store.list_agents_in_graph(Uuid::new_v4()).await?;
         assert!(agents.is_empty());
+        Ok(())
+    }
+
+    // --- list_graphs ---
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn list_graphs_returns_every_graph_id(pool: PgPool) -> sqlx::Result<()> {
+        let store = GraphStore::new(pool);
+        assert!(
+            store.list_graphs().await?.is_empty(),
+            "empty DB has no graphs"
+        );
+        let a = store.create_graph("alpha", serde_json::json!({})).await?;
+        let b = store.create_graph("beta", serde_json::json!({})).await?;
+        let ids = store.list_graphs().await?;
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&a.id) && ids.contains(&b.id));
         Ok(())
     }
 

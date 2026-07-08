@@ -40,7 +40,7 @@ use temporalio_common::protos::temporal::api::enums::v1::ParentClosePolicy;
 use temporalio_macros::{workflow, workflow_methods};
 use temporalio_sdk::{
     ActivityOptions, ChildWorkflowOptions, ContinueAsNewOptions, SyncWorkflowContext,
-    WorkflowContext, WorkflowResult,
+    WorkflowContext, WorkflowContextView, WorkflowResult,
 };
 
 use crate::activities::{
@@ -290,6 +290,27 @@ pub struct AgentSnapshot {
     pub cumulative_human_ops_observed: u64,
     #[serde(default)]
     pub cumulative_mandate_patches_observed: u64,
+    /// True while the workflow is blocked at the wake gate between cycles, as
+    /// opposed to mid-cycle inside the inner ReAct loop. Quiescence GC uses it
+    /// to exclude a busy-but-empty-queued agent (an inspection loop) from
+    /// retirement.
+    #[serde(default)]
+    pub parked: bool,
+    /// True for a `never`-cadence agent (`idle_period: never`), which self-wakes
+    /// only on its first cycle and thereafter waits on signals alone. Quiescence
+    /// GC only retires graphs whose agents are all `never`, since only then is
+    /// "all idle" a fixpoint with no self-origination.
+    #[serde(default)]
+    pub is_never: bool,
+    /// Cycle counter (bumps at each cycle end). `>= 1` means the agent is past
+    /// its forced first wake, so a `never` agent has no self-wake timer armed.
+    #[serde(default)]
+    pub tick: u64,
+    /// The idle cadence pinned by the last `Decision::Idle`. Held for the future
+    /// cadence-aware detector; the `never`-scope predicate does not read it,
+    /// since `is_never` already implies no armed self-wake past the first cycle.
+    #[serde(default)]
+    pub next_wake: Option<Duration>,
 }
 
 impl AgentSnapshot {
@@ -303,6 +324,10 @@ impl AgentSnapshot {
             cumulative_triggers_observed: workflow.cumulative_triggers_observed,
             cumulative_human_ops_observed: workflow.cumulative_human_ops_observed,
             cumulative_mandate_patches_observed: workflow.cumulative_mandate_patches_observed,
+            parked: workflow.parked,
+            is_never: workflow.is_never,
+            tick: workflow.tick,
+            next_wake: workflow.next_wake,
         }
     }
 }
@@ -385,6 +410,16 @@ pub struct AgentWorkflow {
     /// `ctx.child_workflow(..)` has dispatched the child run. Round-trips
     /// across continue-as-new via [`Carryover::child_handles`].
     child_handles: Vec<AgentRef>,
+    /// True while blocked at the wake gate between cycles; false while a cycle
+    /// runs. Transient runtime state, not carried across continue-as-new — a
+    /// post-CAN run re-enters the gate and re-sets it. Surfaced on
+    /// [`AgentSnapshot`] for quiescence GC.
+    parked: bool,
+    /// Whether this agent's mandate is `never`-cadence, set once per run from
+    /// the immutable input. Recomputed (not carried) each run since the mandate
+    /// rides the durable input across continue-as-new. Surfaced on
+    /// [`AgentSnapshot`] for quiescence GC.
+    is_never: bool,
 }
 
 #[workflow_methods]
@@ -435,6 +470,15 @@ impl AgentWorkflow {
         AgentSnapshot::from_state(self)
     }
 
+    /// `snapshot` — the same [`AgentSnapshot`], read-only. Unlike
+    /// [`Self::inspect_state`] (an update, recorded in history), a query is
+    /// history-free, so the quiescence-GC reaper can poll every graph on an
+    /// interval without inflating the history of long-lived parked agents.
+    #[query]
+    pub fn snapshot(&self, _ctx: &WorkflowContextView) -> AgentSnapshot {
+        AgentSnapshot::from_state(self)
+    }
+
     /// Workflow entry point — the per-tick loop body.
     ///
     /// Reads top-to-bottom: hydrate carryover (if any) → loop {wake → drain
@@ -481,6 +525,7 @@ impl AgentWorkflow {
         // cycle, then wait on signals alone (the wake gate stops arming the
         // idle timer).
         let never = input.mandate.is_never();
+        ctx.state_mut(|s| s.is_never = never);
         loop {
             // The interim `step_cap` runaway backstop. Checked before
             // `wait_for_tick` so an over-budget agent retires without waking
@@ -511,7 +556,9 @@ impl AgentWorkflow {
                 }
                 session
             } else {
+                ctx.state_mut(|s| s.parked = true);
                 wait_for_tick(ctx, never).await;
+                ctx.state_mut(|s| s.parked = false);
 
                 // Retirement short-circuit fires before any activity
                 // invocation and before any CAN check, so a `retire` signal
@@ -1595,6 +1642,10 @@ mod tests {
             cumulative_triggers_observed: 5,
             cumulative_human_ops_observed: 7,
             cumulative_mandate_patches_observed: 11,
+            parked: true,
+            is_never: true,
+            tick: 4,
+            next_wake: Some(Duration::from_secs(30)),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: AgentSnapshot = serde_json::from_str(&json).unwrap();

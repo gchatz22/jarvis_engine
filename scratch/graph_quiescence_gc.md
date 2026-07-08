@@ -140,7 +140,7 @@ queue this worker serves.
 
 ```
 loop {
-    sleep(GC_INTERVAL);                       // e.g. 30s
+    sleep(GC_INTERVAL);                       // default 5 min
     for graph in structural_db.graphs() {
         let snaps = graph.agents().inspect_state();   // existing #[update]
         tracker[graph].observe(now, snaps);           // pure debounce, below

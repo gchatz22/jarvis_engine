@@ -49,8 +49,8 @@ pub struct ReaperConfig {
 }
 
 impl ReaperConfig {
-    pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
-    pub const DEFAULT_WAVE_MARGIN: Duration = Duration::from_secs(120);
+    pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(300);
+    pub const DEFAULT_WAVE_MARGIN: Duration = Duration::from_secs(1800);
 
     /// Read `CORAL_GC_INTERVAL_SECS` / `CORAL_GC_WAVE_MARGIN_SECS`, falling back
     /// to the production defaults.
